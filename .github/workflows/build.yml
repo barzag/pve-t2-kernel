@@ -544,6 +544,263 @@ jobs:
           - Excluded patch: \`${SKIPPED_PATCH}\`
           - Exclusion reason: MacBookPro15,1-specific, not applicable to \`${TARGET_MODEL}\`
           EOF
+
+      - name: Build Macmini8,1 T2 kernel
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PVE_DIR="proxmox-pve-kernel"
+          KERNEL_VERSION="${{ steps.pve_repo.outputs.kernel }}"
+
+          echo "Starting first real T2 kernel build"
+          echo "Target:  Macmini8,1"
+          echo "Kernel:  ${KERNEL_VERSION}-pve-t2"
+
+          #
+          # Free disk space on the ephemeral GitHub runner.
+          #
+
+          echo "Disk space before cleanup:"
+          df -h /
+
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            2>/dev/null || true
+
+          docker image prune -af >/dev/null 2>&1 || true
+
+          echo "Disk space after cleanup:"
+          df -h /
+
+          #
+          # Pin both Proxmox submodules to their official sources.
+          #
+
+          git -C "${PVE_DIR}" config \
+            submodule.submodules/ubuntu-kernel.url \
+            https://git.proxmox.com/git/mirror_ubuntu-kernels.git
+
+          git -C "${PVE_DIR}" config \
+            submodule.submodules/zfsonlinux.url \
+            https://git.proxmox.com/git/zfsonlinux.git
+
+          #
+          # Build in Debian Trixie.
+          # The Docker image is pinned to the exact digest already
+          # observed and validated by our CI.
+          #
+
+          DOCKER_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
+
+          docker run \
+            --rm \
+            -v "${PWD}:/workspace" \
+            -w "/workspace/${PVE_DIR}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              echo "Installing Debian prerequisites..."
+
+              apt-get update -qq
+
+              apt-get install -y -qq \
+                --no-install-recommends \
+                ca-certificates \
+                curl \
+                >/dev/null
+
+              curl \
+                --fail \
+                --location \
+                --silent \
+                --show-error \
+                https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
+                -o /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+              cat > /etc/apt/sources.list.d/proxmox.sources <<EOF
+          Types: deb
+          URIs: http://download.proxmox.com/debian/pve
+          Suites: trixie
+          Components: pve-no-subscription
+          Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+          EOF
+
+              apt-get update -qq
+
+              echo "Installing Proxmox kernel build dependencies..."
+
+              apt-get install -y -qq \
+                --no-install-recommends \
+                asciidoc-base \
+                automake \
+                bc \
+                bindgen \
+                bison \
+                build-essential \
+                cpio \
+                debhelper \
+                dh-python \
+                dpkg-dev \
+                dwarves \
+                fakeroot \
+                file \
+                flex \
+                gawk \
+                gcc \
+                git \
+                kmod \
+                libdw-dev \
+                libelf-dev \
+                libiberty-dev \
+                libnuma-dev \
+                libpve-common-perl \
+                libslang2-dev \
+                libssl-dev \
+                libtool \
+                lintian \
+                lz4 \
+                perl-modules \
+                python3-dev \
+                python3-minimal \
+                rsync \
+                rust-clippy \
+                rust-src \
+                rustc \
+                rustfmt \
+                sphinx-common \
+                xmlto \
+                zlib1g-dev \
+                zstd \
+                >/dev/null
+
+              git config \
+                --global \
+                --add safe.directory \
+                /workspace/proxmox-pve-kernel
+
+              echo "Initializing exact Proxmox submodules..."
+
+              git submodule update \
+                --init \
+                --depth 1 \
+                submodules/ubuntu-kernel
+
+              git submodule update \
+                --init \
+                --recursive \
+                submodules/zfsonlinux
+
+              echo
+              echo "Building kernel..."
+              echo
+
+              make deb
+            '
+
+          #
+          # Validate generated packages.
+          #
+
+          echo
+          echo "Build completed. Validating packages..."
+
+          KERNEL_DEB="$(
+            find "${PVE_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "proxmox-kernel-*-pve-t2_*.deb" \
+              -print |
+            sed -n "1p"
+          )"
+
+          HEADER_DEB="$(
+            find "${PVE_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "proxmox-headers-*-pve-t2_*.deb" \
+              -print |
+            sed -n "1p"
+          )"
+
+          if [[ -z "${KERNEL_DEB}" ]]; then
+            echo "ERROR: T2 kernel package was not generated"
+            exit 1
+          fi
+
+          if [[ -z "${HEADER_DEB}" ]]; then
+            echo "ERROR: T2 headers package was not generated"
+            exit 1
+          fi
+
+          echo
+          echo "Kernel package:"
+          dpkg-deb \
+            --show \
+            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
+            "${KERNEL_DEB}"
+
+          echo
+          echo "Headers package:"
+          dpkg-deb \
+            --show \
+            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
+            "${HEADER_DEB}"
+
+          #
+          # Verify that the generated package really contains
+          # our pve-t2 kernel image.
+          #
+
+          if ! dpkg-deb -c "${KERNEL_DEB}" |
+            grep -Fq "/boot/vmlinuz-${KERNEL_VERSION}-pve-t2"
+          then
+            echo "ERROR: expected T2 vmlinuz was not found in the package"
+            exit 1
+          fi
+
+          echo
+          echo "Generating SHA256 checksums..."
+
+          sha256sum \
+            "${KERNEL_DEB}" \
+            "${HEADER_DEB}" \
+            | tee "${PVE_DIR}/SHA256SUMS"
+
+          echo
+          echo "FIRST T2 KERNEL BUILD SUCCESSFUL"
+          echo "Kernel: ${KERNEL_VERSION}-pve-t2"
+
+          echo "kernel_deb=${KERNEL_DEB}" >> "$GITHUB_OUTPUT"
+          echo "header_deb=${HEADER_DEB}" >> "$GITHUB_OUTPUT"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+          ## First T2 kernel build
+          - Target: \`Macmini8,1\`
+          - Kernel: \`${KERNEL_VERSION}-pve-t2\`
+          - Build result: **SUCCESS**
+          - Kernel package: \`$(basename "${KERNEL_DEB}")\`
+          - Headers package: \`$(basename "${HEADER_DEB}")\`
+          EOF
+
+      - name: Upload first T2 kernel artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pve-t2-${{ steps.pve_repo.outputs.kernel }}-macmini8-1
+          path: |
+            proxmox-pve-kernel/proxmox-kernel-*-pve-t2_*.deb
+            proxmox-pve-kernel/proxmox-headers-*-pve-t2_*.deb
+            proxmox-pve-kernel/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
       - name: Write discovery summary
         if: always()
         shell: bash
