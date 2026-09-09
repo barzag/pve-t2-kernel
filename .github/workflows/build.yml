@@ -685,27 +685,43 @@ jobs:
                 --add safe.directory \
                 /workspace/proxmox-pve-kernel
 
-              KERNEL_BASE="$(
-                awk -F= '
-                  /^KERNEL_MAJ=/ { maj=$2 }
-                  /^KERNEL_MIN=/ { min=$2 }
-                  /^KERNEL_PATCHLEVEL=/ { patch=$2 }
-                  END {
-                    print maj "." min "." patch
-                  }
-                ' Makefile
+              KERNEL_MAJ="$(
+                sed -n "s/^KERNEL_MAJ=//p" Makefile |
+                xargs
               )"
+              
+              KERNEL_MIN="$(
+                sed -n "s/^KERNEL_MIN=//p" Makefile |
+                xargs
+              )"
+              
+              KERNEL_PATCHLEVEL="$(
+                sed -n "s/^KERNEL_PATCHLEVEL=//p" Makefile |
+                xargs
+              )"
+              
+              if [[ ! "${KERNEL_MAJ}" =~ ^[0-9]+$ ]] ||
+                 [[ ! "${KERNEL_MIN}" =~ ^[0-9]+$ ]] ||
+                 [[ ! "${KERNEL_PATCHLEVEL}" =~ ^[0-9]+$ ]]
+              then
+                echo "ERROR: unable to determine Proxmox kernel base version"
+                exit 1
+              fi
+              
+              KERNEL_BASE="${KERNEL_MAJ}.${KERNEL_MIN}.${KERNEL_PATCHLEVEL}"
+              
               BUILD_KERNEL_DIR="/workspace/proxmox-pve-kernel/proxmox-kernel-${KERNEL_BASE}/ubuntu-kernel"
-
-                echo "Allowing Proxmox build kernel directory:"
-                echo "${BUILD_KERNEL_DIR}"
-                
-                git config \
-                  --global \
-                  --add safe.directory \
-                  "${BUILD_KERNEL_DIR}"
-                
-                echo "Initializing exact Proxmox submodules..."
+              
+              echo "Kernel base: ${KERNEL_BASE}"
+              echo "Allowing Proxmox build kernel directory:"
+              echo "${BUILD_KERNEL_DIR}"
+              
+              git config \
+                --global \
+                --add safe.directory \
+                "${BUILD_KERNEL_DIR}"
+              
+              echo "Initializing exact Proxmox submodules..."
 
               git submodule update \
                 --init \
