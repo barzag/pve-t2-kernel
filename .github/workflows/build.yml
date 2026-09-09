@@ -1,0 +1,79 @@
+name: Bootstrap upstream discovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover upstream revisions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Clone Proxmox kernel source
+        id: pve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/proxmox/pve-kernel.git \
+            proxmox-pve-kernel
+
+          cd proxmox-pve-kernel
+
+          PVE_SHA="$(git rev-parse HEAD)"
+          PVE_BRANCH="$(git symbolic-ref --short HEAD)"
+          PVE_SUBJECT="$(git log -1 --pretty=%s)"
+          PVE_CHANGELOG="$(git show HEAD:debian/changelog | head -n 1)"
+
+          echo "sha=${PVE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=${PVE_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "subject=${PVE_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "changelog=${PVE_CHANGELOG}" >> "$GITHUB_OUTPUT"
+
+      - name: Clone T2 patch source
+        id: t2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/t2linux/linux-t2-patches.git \
+            linux-t2-patches
+
+          cd linux-t2-patches
+
+          T2_SHA="$(git rev-parse HEAD)"
+          T2_BRANCH="$(git symbolic-ref --short HEAD)"
+          T2_SUBJECT="$(git log -1 --pretty=%s)"
+          T2_KVER="$(git show HEAD:version | tr -d '\r\n')"
+
+          echo "sha=${T2_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=${T2_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "subject=${T2_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "kver=${T2_KVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Write discovery summary
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          # Upstream discovery
+
+          ## Proxmox pve-kernel
+          - Branch: `${{ steps.pve.outputs.branch }}`
+          - SHA: `${{ steps.pve.outputs.sha }}`
+          - Latest commit: `${{ steps.pve.outputs.subject }}`
+          - Debian changelog: `${{ steps.pve.outputs.changelog }}`
+
+          ## t2linux/linux-t2-patches
+          - Branch: `${{ steps.t2.outputs.branch }}`
+          - SHA: `${{ steps.t2.outputs.sha }}`
+          - Kernel target: `${{ steps.t2.outputs.kver }}`
+          - Latest commit: `${{ steps.t2.outputs.subject }}`
+
+          This workflow only discovers upstream revisions.
+          It does not build or publish a kernel.
+          EOF
