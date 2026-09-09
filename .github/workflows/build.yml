@@ -794,12 +794,25 @@ jobs:
           # our pve-t2 kernel image.
           #
 
-          if ! dpkg-deb -c "${KERNEL_DEB}" |
-            grep -Fq "/boot/vmlinuz-${KERNEL_VERSION}-pve-t2"
-          then
-            echo "ERROR: expected T2 vmlinuz was not found in the package"
+          KERNEL_CONTENTS="${RUNNER_TEMP}/kernel-package.list"
+          EXPECTED_VMLINUZ="/boot/vmlinuz-${KERNEL_VERSION}-pve-t2"
+          
+          if ! dpkg-deb -c "${KERNEL_DEB}" > "${KERNEL_CONTENTS}"; then
+            echo "ERROR: unable to inspect generated kernel package"
             exit 1
           fi
+          
+          if ! grep -Fq "${EXPECTED_VMLINUZ}" "${KERNEL_CONTENTS}"; then
+            echo "ERROR: expected T2 vmlinuz was not found in the package"
+            echo "Expected: ${EXPECTED_VMLINUZ}"
+            echo
+            echo "Files found under /boot:"
+            grep -F "/boot/" "${KERNEL_CONTENTS}" || true
+            exit 1
+          fi
+          
+          echo "Validated T2 kernel image:"
+          grep -F "${EXPECTED_VMLINUZ}" "${KERNEL_CONTENTS}"
 
           echo
           echo "Generating SHA256 checksums..."
