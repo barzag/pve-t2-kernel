@@ -685,7 +685,27 @@ jobs:
                 --add safe.directory \
                 /workspace/proxmox-pve-kernel
 
-              echo "Initializing exact Proxmox submodules..."
+              KERNEL_BASE="$(
+                awk -F= '
+                  /^KERNEL_MAJ=/ { maj=$2 }
+                  /^KERNEL_MIN=/ { min=$2 }
+                  /^KERNEL_PATCHLEVEL=/ { patch=$2 }
+                  END {
+                    print maj "." min "." patch
+                  }
+                ' Makefile
+              )"
+              BUILD_KERNEL_DIR="/workspace/proxmox-pve-kernel/proxmox-kernel-${KERNEL_BASE}/ubuntu-kernel"
+
+                echo "Allowing Proxmox build kernel directory:"
+                echo "${BUILD_KERNEL_DIR}"
+                
+                git config \
+                  --global \
+                  --add safe.directory \
+                  "${BUILD_KERNEL_DIR}"
+                
+                echo "Initializing exact Proxmox submodules..."
 
               git submodule update \
                 --init \
