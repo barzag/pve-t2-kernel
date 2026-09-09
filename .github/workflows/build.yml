@@ -3,6 +3,12 @@ name: Bootstrap upstream discovery
 on:
   workflow_dispatch:
 
+  push:
+    branches:
+      - bootstrap-ci
+    paths:
+      - ".github/workflows/build.yml"
+
 permissions:
   contents: read
 
@@ -27,7 +33,7 @@ jobs:
           PVE_SHA="$(git rev-parse HEAD)"
           PVE_BRANCH="$(git symbolic-ref --short HEAD)"
           PVE_SUBJECT="$(git log -1 --pretty=%s)"
-          PVE_CHANGELOG="$(git show HEAD:debian/changelog | head -n 1)"
+          PVE_CHANGELOG="$(git show HEAD:debian/changelog | sed -n '1p')"
 
           echo "sha=${PVE_SHA}" >> "$GITHUB_OUTPUT"
           echo "branch=${PVE_BRANCH}" >> "$GITHUB_OUTPUT"
