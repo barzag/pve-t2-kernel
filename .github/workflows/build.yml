@@ -289,27 +289,12 @@ jobs:
             if [[ "${PATCH_NAME}" == "${SKIPPED_PATCH}" ]]; then
               echo "T2 SKIP -> ${PATCH_NAME}"
               echo "Reason: model-specific MBP15,1 i915 patch requires separate validation"
+
               T2_SKIPPED=$((T2_SKIPPED + 1))
               continue
             fi
 
             echo "T2 -> ${PATCH_NAME}"
-
-            if ! patch \
-              --batch \
-              --dry-run \
-              -p1 \
-              < "${patchfile}" \
-              > /tmp/t2-dry-run.log 2>&1
-            then
-              cat /tmp/t2-dry-run.log
-
-              echo "failed_patch=${PATCH_NAME}" >> "$GITHUB_OUTPUT"
-              echo "compatible=false" >> "$GITHUB_OUTPUT"
-
-              echo "ERROR: T2 patch cannot be applied: ${PATCH_NAME}"
-              exit 1
-            fi
 
             if ! patch \
               --batch \
@@ -319,10 +304,13 @@ jobs:
             then
               cat /tmp/t2-apply.log
 
-              echo "failed_patch=${PATCH_NAME}" >> "$GITHUB_OUTPUT"
               echo "compatible=false" >> "$GITHUB_OUTPUT"
+              echo "failed_patch=${PATCH_NAME}" >> "$GITHUB_OUTPUT"
+              echo "patch_count=${T2_COUNT}" >> "$GITHUB_OUTPUT"
+              echo "skipped_count=${T2_SKIPPED}" >> "$GITHUB_OUTPUT"
+              echo "skipped_patch=${SKIPPED_PATCH}" >> "$GITHUB_OUTPUT"
 
-              echo "ERROR: T2 patch failed during application: ${PATCH_NAME}"
+              echo "ERROR: T2 patch failed during real application: ${PATCH_NAME}"
               exit 1
             fi
 
