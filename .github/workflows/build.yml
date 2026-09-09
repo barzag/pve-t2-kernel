@@ -111,9 +111,9 @@ jobs:
             git log origin/master \
               --format='%H%x09%s' |
             awk -F '\t' -v expected="${EXPECTED_SUBJECT}" '
-              $2 == expected {
+              $2 == expected && !found {
                 print $1
-                exit
+                found=1
               }
             '
           )"
