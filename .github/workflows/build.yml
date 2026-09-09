@@ -149,11 +149,21 @@ jobs:
           echo "subject=${PVE_SUBJECT}" >> "$GITHUB_OUTPUT"
           echo "changelog=${PVE_CHANGELOG}" >> "$GITHUB_OUTPUT"
 
-      - name: Clone T2 patch source
+      - name: Resolve T2 patch candidate
         id: t2
         shell: bash
         run: |
           set -euo pipefail
+
+          PVE_KERNEL="${{ steps.pve_repo.outputs.kernel }}"
+
+          PVE_SERIES="$(
+            printf '%s\n' "${PVE_KERNEL}" |
+            sed -E 's/^([0-9]+\.[0-9]+).*/\1/'
+          )"
+
+          echo "Proxmox kernel: ${PVE_KERNEL}"
+          echo "Required T2 series: ${PVE_SERIES}"
 
           git clone --filter=blob:none --no-checkout \
             https://github.com/t2linux/linux-t2-patches.git \
@@ -161,15 +171,48 @@ jobs:
 
           cd linux-t2-patches
 
-          T2_SHA="$(git rev-parse HEAD)"
-          T2_BRANCH="$(git symbolic-ref --short HEAD)"
-          T2_SUBJECT="$(git log -1 --pretty=%s)"
-          T2_KVER="$(git show HEAD:version | tr -d '\r\n')"
+          T2_SHA=""
+
+          while read -r COMMIT; do
+            KVER="$(
+              git show "${COMMIT}:version" 2>/dev/null |
+              sed -n 's/^KVER=//p' |
+              tr -d '\r\n' ||
+              true
+            )"
+
+            if [[ -z "${KVER}" ]]; then
+              continue
+            fi
+
+            T2_SERIES="$(
+              printf '%s\n' "${KVER}" |
+              sed -E 's/^([0-9]+\.[0-9]+).*/\1/'
+            )"
+
+            if [[ "${T2_SERIES}" == "${PVE_SERIES}" ]]; then
+              T2_SHA="${COMMIT}"
+              T2_KVER="${KVER}"
+              break
+            fi
+          done < <(git rev-list origin/main)
+
+          if [[ -z "${T2_SHA}" ]]; then
+            echo "ERROR: no T2 candidate found for kernel series ${PVE_SERIES}"
+            exit 1
+          fi
+
+          T2_SUBJECT="$(git show -s --format=%s "${T2_SHA}")"
+
+          echo "Resolved T2 candidate:"
+          echo "SHA:     ${T2_SHA}"
+          echo "KVER:    ${T2_KVER}"
+          echo "Commit:  ${T2_SUBJECT}"
 
           echo "sha=${T2_SHA}" >> "$GITHUB_OUTPUT"
-          echo "branch=${T2_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "branch=main" >> "$GITHUB_OUTPUT"
           echo "subject=${T2_SUBJECT}" >> "$GITHUB_OUTPUT"
-          echo "kver=${T2_KVER}" >> "$GITHUB_OUTPUT"
+          echo "kver=KVER=${T2_KVER}" >> "$GITHUB_OUTPUT"
 
       - name: Write discovery summary
         shell: bash
