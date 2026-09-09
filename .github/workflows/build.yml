@@ -87,11 +87,17 @@ jobs:
           echo "package=${LATEST_PACKAGE}" >> "$GITHUB_OUTPUT"
           echo "kernel=${LATEST_KERNEL}" >> "$GITHUB_OUTPUT"
           echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT" 
-      - name: Clone Proxmox kernel source
+      - name: Resolve published Proxmox source commit
         id: pve
         shell: bash
         run: |
           set -euo pipefail
+
+          PUBLISHED_KERNEL="${{ steps.pve_repo.outputs.kernel }}"
+          PUBLISHED_VERSION="${{ steps.pve_repo.outputs.version }}"
+
+          echo "Published kernel:  ${PUBLISHED_KERNEL}"
+          echo "Published version: ${PUBLISHED_VERSION}"
 
           git clone --filter=blob:none --no-checkout \
             https://github.com/proxmox/pve-kernel.git \
@@ -99,13 +105,47 @@ jobs:
 
           cd proxmox-pve-kernel
 
-          PVE_SHA="$(git rev-parse HEAD)"
-          PVE_BRANCH="$(git symbolic-ref --short HEAD)"
-          PVE_SUBJECT="$(git log -1 --pretty=%s)"
-          PVE_CHANGELOG="$(git show HEAD:debian/changelog | sed -n '1p')"
+          EXPECTED_SUBJECT="update ABI file for ${PUBLISHED_KERNEL}-pve (amd64)"
+
+          PVE_SHA="$(
+            git log origin/master \
+              --format='%H%x09%s' |
+            awk -F '\t' -v expected="${EXPECTED_SUBJECT}" '
+              $2 == expected {
+                print $1
+                exit
+              }
+            '
+          )"
+
+          if [[ -z "${PVE_SHA}" ]]; then
+            echo "ERROR: unable to resolve published Proxmox source commit"
+            echo "Expected commit subject:"
+            echo "${EXPECTED_SUBJECT}"
+            exit 1
+          fi
+
+          PVE_SUBJECT="$(git show -s --format=%s "${PVE_SHA}")"
+          PVE_CHANGELOG="$(
+            git show "${PVE_SHA}:debian/changelog" |
+            sed -n '1p'
+          )"
+
+          if ! grep -Fq "(${PUBLISHED_VERSION}) " <<< "${PVE_CHANGELOG}"; then
+            echo "ERROR: resolved Git commit does not match published package version"
+            echo "Published version: ${PUBLISHED_VERSION}"
+            echo "Resolved SHA:      ${PVE_SHA}"
+            echo "Changelog:         ${PVE_CHANGELOG}"
+            exit 1
+          fi
+
+          echo "Resolved Proxmox source:"
+          echo "SHA:       ${PVE_SHA}"
+          echo "Commit:    ${PVE_SUBJECT}"
+          echo "Changelog: ${PVE_CHANGELOG}"
 
           echo "sha=${PVE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "branch=${PVE_BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "branch=master" >> "$GITHUB_OUTPUT"
           echo "subject=${PVE_SUBJECT}" >> "$GITHUB_OUTPUT"
           echo "changelog=${PVE_CHANGELOG}" >> "$GITHUB_OUTPUT"
 
