@@ -27,6 +27,7 @@ jobs:
           RESULT="$(
             docker run --rm debian:trixie bash -c '
               set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
 
               apt-get update -qq
               apt-get install -y -qq ca-certificates curl >/dev/null
@@ -86,7 +87,8 @@ jobs:
 
           echo "package=${LATEST_PACKAGE}" >> "$GITHUB_OUTPUT"
           echo "kernel=${LATEST_KERNEL}" >> "$GITHUB_OUTPUT"
-          echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT" 
+          echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+
       - name: Resolve published Proxmox source commit
         id: pve
         shell: bash
@@ -126,6 +128,7 @@ jobs:
           fi
 
           PVE_SUBJECT="$(git show -s --format=%s "${PVE_SHA}")"
+
           PVE_CHANGELOG="$(
             git show "${PVE_SHA}:debian/changelog" |
             sed -n '1p'
@@ -149,6 +152,71 @@ jobs:
           echo "subject=${PVE_SUBJECT}" >> "$GITHUB_OUTPUT"
           echo "changelog=${PVE_CHANGELOG}" >> "$GITHUB_OUTPUT"
 
+      - name: Resolve T2 patch candidate
+        id: t2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PVE_KERNEL="${{ steps.pve_repo.outputs.kernel }}"
+
+          PVE_SERIES="$(
+            printf '%s\n' "${PVE_KERNEL}" |
+            sed -E 's/^([0-9]+\.[0-9]+).*/\1/'
+          )"
+
+          echo "Proxmox kernel: ${PVE_KERNEL}"
+          echo "Required T2 series: ${PVE_SERIES}"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/t2linux/linux-t2-patches.git \
+            linux-t2-patches
+
+          cd linux-t2-patches
+
+          T2_SHA=""
+
+          while read -r COMMIT; do
+            KVER="$(
+              git show "${COMMIT}:version" 2>/dev/null |
+              sed -n 's/^KVER=//p' |
+              tr -d '\r\n' ||
+              true
+            )"
+
+            if [[ -z "${KVER}" ]]; then
+              continue
+            fi
+
+            T2_SERIES="$(
+              printf '%s\n' "${KVER}" |
+              sed -E 's/^([0-9]+\.[0-9]+).*/\1/'
+            )"
+
+            if [[ "${T2_SERIES}" == "${PVE_SERIES}" ]]; then
+              T2_SHA="${COMMIT}"
+              T2_KVER="${KVER}"
+              break
+            fi
+          done < <(git rev-list origin/main)
+
+          if [[ -z "${T2_SHA}" ]]; then
+            echo "ERROR: no T2 candidate found for kernel series ${PVE_SERIES}"
+            exit 1
+          fi
+
+          T2_SUBJECT="$(git show -s --format=%s "${T2_SHA}")"
+
+          echo "Resolved T2 candidate:"
+          echo "SHA:    ${T2_SHA}"
+          echo "KVER:   ${T2_KVER}"
+          echo "Commit: ${T2_SUBJECT}"
+
+          echo "sha=${T2_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=main" >> "$GITHUB_OUTPUT"
+          echo "subject=${T2_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "kver=KVER=${T2_KVER}" >> "$GITHUB_OUTPUT"
+
       - name: Test T2 patch application
         id: compat
         shell: bash
@@ -164,7 +232,12 @@ jobs:
           echo "T2 SHA:      ${T2_SHA}"
 
           cd proxmox-pve-kernel
+
           git checkout --detach "${PVE_SHA}"
+
+          git config \
+            submodule.submodules/ubuntu-kernel.url \
+            https://git.proxmox.com/git/mirror_ubuntu-kernels.git
 
           git submodule update \
             --init \
@@ -246,6 +319,7 @@ jobs:
               echo "failed_patch=${PATCH_NAME}" >> "$GITHUB_OUTPUT"
               echo "compatible=false" >> "$GITHUB_OUTPUT"
 
+              echo "ERROR: T2 patch failed during application: ${PATCH_NAME}"
               exit 1
             fi
 
@@ -263,28 +337,34 @@ jobs:
           echo "All ${T2_COUNT} T2 patches applied successfully."
 
       - name: Write discovery summary
+        if: always()
         shell: bash
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
           # Upstream discovery
-          
+
           ## Published Proxmox kernel
           - Repository: `pve-no-subscription`
           - Package: `${{ steps.pve_repo.outputs.package }}`
           - Kernel: `${{ steps.pve_repo.outputs.kernel }}`
           - Package version: `${{ steps.pve_repo.outputs.version }}`
-          ## Proxmox pve-kernel
+
+          ## Proxmox source
           - Branch: `${{ steps.pve.outputs.branch }}`
           - SHA: `${{ steps.pve.outputs.sha }}`
-          - Latest commit: `${{ steps.pve.outputs.subject }}`
+          - Commit: `${{ steps.pve.outputs.subject }}`
           - Debian changelog: `${{ steps.pve.outputs.changelog }}`
 
-          ## t2linux/linux-t2-patches
+          ## T2 candidate
           - Branch: `${{ steps.t2.outputs.branch }}`
           - SHA: `${{ steps.t2.outputs.sha }}`
           - Kernel target: `${{ steps.t2.outputs.kver }}`
-          - Latest commit: `${{ steps.t2.outputs.subject }}`
+          - Commit: `${{ steps.t2.outputs.subject }}`
 
-          This workflow only discovers upstream revisions.
-          It does not build or publish a kernel.
+          ## Compatibility
+          - Compatible: `${{ steps.compat.outputs.compatible }}`
+          - T2 patches applied: `${{ steps.compat.outputs.patch_count }}`
+          - Failed patch: `${{ steps.compat.outputs.failed_patch }}`
+
+          This workflow does not compile or publish a kernel yet.
           EOF
