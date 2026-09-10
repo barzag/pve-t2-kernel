@@ -7,7 +7,17 @@ PVE_DIR="proxmox-pve-kernel"
 T2_DIR="linux-t2-patches"
 
 TARGET_MODEL="Macmini8,1"
-SKIPPED_PATCH="2008-i915-4-lane-quirk-for-mbp15-1.patch"
+
+# Minimal T2 patchset required for Apple SMC / thermal sensors /
+# fan support on Mac mini 2018 (Macmini8,1).
+MACMINI_T2_PATCHES=(
+  "3001-applesmc-convert-static-structures-to-drvdata.patch"
+  "3002-applesmc-make-io-port-base-addr-dynamic.patch"
+  "3003-applesmc-switch-to-acpi_device-from-platform.patch"
+  "3004-applesmc-key-interface-wrappers.patch"
+  "3005-applesmc-basic-mmio-interface-implementation.patch"
+  "3006-applesmc-fan-support-on-T2-Macs.patch"
+)
 
 if [[ -z "${PVE_SHA:-}" ]]; then
   echo "ERROR: PVE_SHA is not defined" >&2
@@ -31,8 +41,13 @@ fi
 
 echo "Testing compatibility:"
 echo "Target:      ${TARGET_MODEL}"
+echo "Profile:     AppleSMC / sensors / fan only"
 echo "Proxmox SHA: ${PVE_SHA}"
 echo "T2 SHA:      ${T2_SHA}"
+
+#
+# Lock both source trees to the expected revisions.
+#
 
 git -C "${PVE_DIR}" checkout --detach "${PVE_SHA}"
 
@@ -47,6 +62,38 @@ git -C "${PVE_DIR}" submodule update \
 
 git -C "${T2_DIR}" checkout --detach "${T2_SHA}"
 
+#
+# Verify that every patch required by the Macmini8,1 profile exists.
+#
+
+for PATCH_NAME in "${MACMINI_T2_PATCHES[@]}"; do
+  if [[ ! -f "${T2_DIR}/${PATCH_NAME}" ]]; then
+    echo "ERROR: required T2 patch is missing: ${PATCH_NAME}" >&2
+    exit 1
+  fi
+done
+
+TOTAL_T2_PATCHES="$(
+  find "${T2_DIR}" \
+    -maxdepth 1 \
+    -type f \
+    -name '*.patch' |
+  wc -l
+)"
+
+REQUIRED_PATCH_COUNT="${#MACMINI_T2_PATCHES[@]}"
+
+if [[ "${TOTAL_T2_PATCHES}" -lt "${REQUIRED_PATCH_COUNT}" ]]; then
+  echo "ERROR: invalid T2 patch repository state" >&2
+  exit 1
+fi
+
+T2_SKIPPED=$((TOTAL_T2_PATCHES - REQUIRED_PATCH_COUNT))
+
+#
+# Prepare a clean Linux source tree for compatibility testing.
+#
+
 rm -rf kernel-compat
 
 cp -a \
@@ -59,10 +106,16 @@ rm -rf \
 
 cd kernel-compat
 
+#
+# Apply official Proxmox patches first.
+#
+
 echo
 echo "Applying official Proxmox patches..."
 
 for patchfile in "../${PVE_DIR}"/patches/kernel/*.patch; do
+  [[ -e "${patchfile}" ]] || continue
+
   PATCH_NAME="$(basename "${patchfile}")"
 
   echo "PVE -> ${PATCH_NAME}"
@@ -79,31 +132,24 @@ for patchfile in "../${PVE_DIR}"/patches/kernel/*.patch; do
   fi
 done
 
+#
+# Apply only the Macmini8,1 T2 allowlist.
+#
+
 echo
-echo "Applying T2 patches..."
+echo "Applying Macmini8,1 T2 patches..."
 
 T2_COUNT=0
-T2_SKIPPED=0
 
-for patchfile in "../${T2_DIR}"/*.patch; do
-  [[ -e "${patchfile}" ]] || continue
-
-  PATCH_NAME="$(basename "${patchfile}")"
-
-  if [[ "${PATCH_NAME}" == "${SKIPPED_PATCH}" ]]; then
-    echo "T2 SKIP -> ${PATCH_NAME}"
-    echo "Reason: MacBookPro15,1-specific; not applicable to ${TARGET_MODEL}"
-
-    T2_SKIPPED=$((T2_SKIPPED + 1))
-    continue
-  fi
+for PATCH_NAME in "${MACMINI_T2_PATCHES[@]}"; do
+  PATCH_FILE="../${T2_DIR}/${PATCH_NAME}"
 
   echo "T2 -> ${PATCH_NAME}"
 
   if ! patch \
     --batch \
     -p1 \
-    < "${patchfile}" \
+    < "${PATCH_FILE}" \
     > /tmp/t2-patch.log 2>&1
   then
     cat /tmp/t2-patch.log
@@ -113,7 +159,7 @@ for patchfile in "../${T2_DIR}"/*.patch; do
       echo "failed_patch=${PATCH_NAME}" >> "${GITHUB_OUTPUT}"
       echo "patch_count=${T2_COUNT}" >> "${GITHUB_OUTPUT}"
       echo "skipped_count=${T2_SKIPPED}" >> "${GITHUB_OUTPUT}"
-      echo "skipped_patch=${SKIPPED_PATCH}" >> "${GITHUB_OUTPUT}"
+      echo "skipped_patch=non-Macmini8,1 T2 patches" >> "${GITHUB_OUTPUT}"
     fi
 
     echo "ERROR: T2 patch failed: ${PATCH_NAME}" >&2
@@ -123,20 +169,24 @@ for patchfile in "../${T2_DIR}"/*.patch; do
   T2_COUNT=$((T2_COUNT + 1))
 done
 
-if [[ "${T2_COUNT}" -eq 0 ]]; then
-  echo "ERROR: no T2 patches were applied" >&2
+if [[ "${T2_COUNT}" -ne "${REQUIRED_PATCH_COUNT}" ]]; then
+  echo "ERROR: unexpected applied T2 patch count" >&2
+  echo "Expected: ${REQUIRED_PATCH_COUNT}"
+  echo "Applied:  ${T2_COUNT}"
   exit 1
 fi
 
 echo
 echo "Patch compatibility passed."
+echo "Target:  ${TARGET_MODEL}"
 echo "Applied: ${T2_COUNT}"
-echo "Skipped: ${T2_SKIPPED}"
+echo "Ignored: ${T2_SKIPPED} non-Macmini8,1 T2 patches"
+echo "Profile: AppleSMC / sensors / fan only"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "compatible=true" >> "${GITHUB_OUTPUT}"
   echo "failed_patch=" >> "${GITHUB_OUTPUT}"
   echo "patch_count=${T2_COUNT}" >> "${GITHUB_OUTPUT}"
   echo "skipped_count=${T2_SKIPPED}" >> "${GITHUB_OUTPUT}"
-  echo "skipped_patch=${SKIPPED_PATCH}" >> "${GITHUB_OUTPUT}"
+  echo "skipped_patch=non-Macmini8,1 T2 patches" >> "${GITHUB_OUTPUT}"
 fi
