@@ -3,12 +3,6 @@ name: Bootstrap upstream discovery
 on:
   workflow_dispatch:
 
-  push:
-    branches:
-      - bootstrap-ci
-    paths:
-      - ".github/workflows/build.yml"
-
 permissions:
   contents: read
 
