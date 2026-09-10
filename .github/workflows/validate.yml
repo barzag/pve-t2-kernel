@@ -53,6 +53,16 @@ jobs:
         shell: bash
         run: |
           bash scripts/validate-config.sh
+          
+      - name: Validate T2 build preparation
+        id: integrate
+        shell: bash
+        env:
+          PVE_SHA: ${{ steps.pve.outputs.sha }}
+          T2_SHA: ${{ steps.t2.outputs.sha }}
+          EXPECTED_PATCH_COUNT: ${{ steps.compat.outputs.patch_count }}
+        run: |
+          bash scripts/prepare-integration.sh
 
       - name: Write validation summary
         if: always()
