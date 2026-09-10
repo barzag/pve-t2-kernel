@@ -1,0 +1,390 @@
+name: Release existing T2 kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Successful build workflow run ID"
+        required: true
+        default: "34400617786"
+
+      tag:
+        description: "Release tag"
+        required: true
+        default: "v7.0.14-16-pve-t2-macmini8-1"
+
+      title:
+        description: "Release title"
+        required: true
+        default: "Proxmox VE 7.0.14-16 T2 kernel for Macmini8,1"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  release:
+    name: Create draft release from existing build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Validate selected build run
+        id: run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "Inspecting workflow run ${RUN_ID}..."
+
+          RUN_JSON="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+          )"
+
+          STATUS="$(
+            jq -r '.status // empty' <<< "${RUN_JSON}"
+          )"
+
+          CONCLUSION="$(
+            jq -r '.conclusion // empty' <<< "${RUN_JSON}"
+          )"
+
+          HEAD_SHA="$(
+            jq -r '.head_sha // empty' <<< "${RUN_JSON}"
+          )"
+
+          HEAD_BRANCH="$(
+            jq -r '.head_branch // empty' <<< "${RUN_JSON}"
+          )"
+
+          WORKFLOW_PATH="$(
+            jq -r '.path // empty' <<< "${RUN_JSON}"
+          )"
+
+          if [[ "${STATUS}" != "completed" ]]; then
+            echo "ERROR: selected workflow run is not completed"
+            echo "Status: ${STATUS}"
+            exit 1
+          fi
+
+          if [[ "${CONCLUSION}" != "success" ]]; then
+            echo "ERROR: selected workflow run did not succeed"
+            echo "Conclusion: ${CONCLUSION}"
+            exit 1
+          fi
+
+          if [[ "${WORKFLOW_PATH}" != ".github/workflows/build.yml" ]]; then
+            echo "ERROR: selected run did not originate from build.yml"
+            echo "Workflow path: ${WORKFLOW_PATH}"
+            exit 1
+          fi
+
+          if [[ -z "${HEAD_SHA}" ]]; then
+            echo "ERROR: unable to resolve build commit SHA"
+            exit 1
+          fi
+
+          echo
+          echo "Build run validated."
+          echo "Run:      ${RUN_ID}"
+          echo "Branch:   ${HEAD_BRANCH}"
+          echo "Commit:   ${HEAD_SHA}"
+          echo "Workflow: ${WORKFLOW_PATH}"
+
+          echo "head_sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          echo "head_branch=${HEAD_BRANCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve T2 build artifact
+        id: artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "Finding T2 artifact for workflow run ${RUN_ID}..."
+
+          ARTIFACTS="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100"
+          )"
+
+          MATCH_COUNT="$(
+            jq '
+              [
+                .artifacts[] |
+                select(
+                  .expired == false and
+                  (.name | test("^pve-t2-.*-macmini8-1$"))
+                )
+              ] |
+              length
+            ' <<< "${ARTIFACTS}"
+          )"
+
+          if [[ "${MATCH_COUNT}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one valid Macmini8,1 T2 artifact"
+            echo "Matching artifacts: ${MATCH_COUNT}"
+            echo
+            jq -r '
+              .artifacts[] |
+              "\(.id)  \(.name)  expired=\(.expired)"
+            ' <<< "${ARTIFACTS}" || true
+            exit 1
+          fi
+
+          ARTIFACT_ID="$(
+            jq -r '
+              .artifacts[] |
+              select(
+                .expired == false and
+                (.name | test("^pve-t2-.*-macmini8-1$"))
+              ) |
+              .id
+            ' <<< "${ARTIFACTS}"
+          )"
+
+          ARTIFACT_NAME="$(
+            jq -r '
+              .artifacts[] |
+              select(
+                .expired == false and
+                (.name | test("^pve-t2-.*-macmini8-1$"))
+              ) |
+              .name
+            ' <<< "${ARTIFACTS}"
+          )"
+
+          ARTIFACT_DIGEST="$(
+            jq -r '
+              .artifacts[] |
+              select(
+                .expired == false and
+                (.name | test("^pve-t2-.*-macmini8-1$"))
+              ) |
+              .digest // ""
+            ' <<< "${ARTIFACTS}"
+          )"
+
+          echo
+          echo "Artifact selected:"
+          echo "ID:     ${ARTIFACT_ID}"
+          echo "Name:   ${ARTIFACT_NAME}"
+          echo "Digest: ${ARTIFACT_DIGEST}"
+
+          echo "id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
+          echo "name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          echo "digest=${ARTIFACT_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Download existing build artifact
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ steps.artifact.outputs.id }}
+          path: release-assets
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: Validate downloaded packages
+        id: packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Downloaded files:"
+          find release-assets -type f -print
+
+          mapfile -t KERNEL_DEBS < <(
+            find release-assets \
+              -type f \
+              -name 'proxmox-kernel-*-pve-t2_*.deb'
+          )
+
+          mapfile -t HEADER_DEBS < <(
+            find release-assets \
+              -type f \
+              -name 'proxmox-headers-*-pve-t2_*.deb'
+          )
+
+          mapfile -t SUM_FILES < <(
+            find release-assets \
+              -type f \
+              -name 'SHA256SUMS'
+          )
+
+          if [[ "${#KERNEL_DEBS[@]}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one kernel .deb"
+            echo "Found: ${#KERNEL_DEBS[@]}"
+            exit 1
+          fi
+
+          if [[ "${#HEADER_DEBS[@]}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one headers .deb"
+            echo "Found: ${#HEADER_DEBS[@]}"
+            exit 1
+          fi
+
+          if [[ "${#SUM_FILES[@]}" -ne 1 ]]; then
+            echo "ERROR: expected exactly one SHA256SUMS file"
+            echo "Found: ${#SUM_FILES[@]}"
+            exit 1
+          fi
+
+          KERNEL_DEB="${KERNEL_DEBS[0]}"
+          HEADER_DEB="${HEADER_DEBS[0]}"
+          SUM_FILE="${SUM_FILES[0]}"
+
+          echo
+          echo "Kernel package:"
+          dpkg-deb \
+            --show \
+            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
+            "${KERNEL_DEB}"
+
+          echo
+          echo "Headers package:"
+          dpkg-deb \
+            --show \
+            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
+            "${HEADER_DEB}"
+
+          echo
+          echo "Checking SHA256SUMS..."
+
+          while read -r EXPECTED FILE_PATH; do
+            [[ -n "${EXPECTED}" ]] || continue
+
+            FILE_NAME="$(basename "${FILE_PATH}")"
+
+            MATCH="$(
+              find release-assets \
+                -type f \
+                -name "${FILE_NAME}" \
+                -print \
+                -quit
+            )"
+
+            if [[ -z "${MATCH}" ]]; then
+              echo "ERROR: checksum references missing file: ${FILE_NAME}"
+              exit 1
+            fi
+
+            ACTUAL="$(
+              sha256sum "${MATCH}" |
+              awk '{print $1}'
+            )"
+
+            if [[ "${ACTUAL}" != "${EXPECTED}" ]]; then
+              echo "ERROR: SHA256 mismatch for ${FILE_NAME}"
+              echo "Expected: ${EXPECTED}"
+              echo "Actual:   ${ACTUAL}"
+              exit 1
+            fi
+
+            echo "OK: ${FILE_NAME}"
+          done < "${SUM_FILE}"
+
+          echo
+          echo "All package checks passed."
+
+          echo "kernel_deb=${KERNEL_DEB}" >> "$GITHUB_OUTPUT"
+          echo "header_deb=${HEADER_DEB}" >> "$GITHUB_OUTPUT"
+          echo "sum_file=${SUM_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare release notes
+        shell: bash
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          HEAD_BRANCH: ${{ steps.run.outputs.head_branch }}
+          ARTIFACT_NAME: ${{ steps.artifact.outputs.name }}
+          ARTIFACT_DIGEST: ${{ steps.artifact.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          cat > release-notes.md <<EOF
+          # Proxmox T2 kernel for Macmini8,1
+
+          This release contains packages produced by an already completed
+          GitHub Actions kernel build.
+
+          ## Build provenance
+
+          - Target hardware: \`Macmini8,1\`
+          - Build workflow run: \`${RUN_ID}\`
+          - Build branch: \`${HEAD_BRANCH}\`
+          - Build commit: \`${HEAD_SHA}\`
+          - Artifact: \`${ARTIFACT_NAME}\`
+          - Artifact digest: \`${ARTIFACT_DIGEST}\`
+
+          ## Packages
+
+          - T2 Proxmox kernel package
+          - Matching T2 kernel headers
+          - SHA256 checksums
+
+          ## Validation status
+
+          The kernel packages were successfully compiled and passed the
+          automated package validation performed by the build workflow.
+
+          **This release remains a draft until the kernel has been installed
+          and validated on the target Macmini8,1 hardware.**
+
+          No kernel compilation is performed by this release workflow.
+          EOF
+
+      - name: Create draft GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TITLE: ${{ inputs.title }}
+          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          KERNEL_DEB: ${{ steps.packages.outputs.kernel_deb }}
+          HEADER_DEB: ${{ steps.packages.outputs.header_deb }}
+          SUM_FILE: ${{ steps.packages.outputs.sum_file }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "ERROR: release ${RELEASE_TAG} already exists"
+            exit 1
+          fi
+
+          echo "Creating draft release:"
+          echo "Tag:    ${RELEASE_TAG}"
+          echo "Title:  ${RELEASE_TITLE}"
+          echo "Target: ${HEAD_SHA}"
+
+          gh release create \
+            "${RELEASE_TAG}" \
+            "${KERNEL_DEB}" \
+            "${HEADER_DEB}" \
+            "${SUM_FILE}" \
+            --draft \
+            --latest=false \
+            --target "${HEAD_SHA}" \
+            --title "${RELEASE_TITLE}" \
+            --notes-file release-notes.md
+
+      - name: Write release summary
+        if: always()
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          # T2 kernel release
+
+          - Source build run: \`${{ inputs.run_id }}\`
+          - Artifact: \`${{ steps.artifact.outputs.name }}\`
+          - Build commit: \`${{ steps.run.outputs.head_sha }}\`
+          - Release tag: \`${{ inputs.tag }}\`
+          - Release state: **draft**
+
+          **No kernel compilation was performed.**
+          EOF
