@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="proxmox-macmini-t2-banner.png"
+       alt="Proxmox Mac mini T2 Kernel"
+       width="100%">
+</p>
+
 # Proxmox Mac mini T2 Kernel
 
 Personal kernel builds for **Mac mini 2018 (Macmini8,1)** running Proxmox on Debian Trixie.
