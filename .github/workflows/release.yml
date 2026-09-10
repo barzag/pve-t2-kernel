@@ -395,7 +395,7 @@ jobs:
             "${SUM_FILE}" \
             --draft \
             --latest=false \
-            --target "${HEAD_SHA}" \
+            --target "${GITHUB_SHA}" \
             --title "${RELEASE_TITLE}" \
             --notes-file release-notes.md
 
