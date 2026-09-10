@@ -107,6 +107,15 @@ for patchfile in "../${T2_DIR}"/*.patch; do
     > /tmp/t2-patch.log 2>&1
   then
     cat /tmp/t2-patch.log
+
+    if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+      echo "compatible=false" >> "${GITHUB_OUTPUT}"
+      echo "failed_patch=${PATCH_NAME}" >> "${GITHUB_OUTPUT}"
+      echo "patch_count=${T2_COUNT}" >> "${GITHUB_OUTPUT}"
+      echo "skipped_count=${T2_SKIPPED}" >> "${GITHUB_OUTPUT}"
+      echo "skipped_patch=${SKIPPED_PATCH}" >> "${GITHUB_OUTPUT}"
+    fi
+
     echo "ERROR: T2 patch failed: ${PATCH_NAME}" >&2
     exit 1
   fi
@@ -125,6 +134,8 @@ echo "Applied: ${T2_COUNT}"
 echo "Skipped: ${T2_SKIPPED}"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "compatible=true" >> "${GITHUB_OUTPUT}"
+  echo "failed_patch=" >> "${GITHUB_OUTPUT}"
   echo "patch_count=${T2_COUNT}" >> "${GITHUB_OUTPUT}"
   echo "skipped_count=${T2_SKIPPED}" >> "${GITHUB_OUTPUT}"
   echo "skipped_patch=${SKIPPED_PATCH}" >> "${GITHUB_OUTPUT}"
