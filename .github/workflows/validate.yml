@@ -13,8 +13,17 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Discover latest published Proxmox kernel
         id: pve_repo
+        shell: bash
+        run: |
+          bash scripts/discover-proxmox.sh
+
+      - name: Resolve exact Proxmox source revision
+        id: pve
         shell: bash
         run: |
           set -euo pipefail
