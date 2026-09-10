@@ -8,7 +8,16 @@ PVE_DIR="proxmox-pve-kernel"
 T2_DIR="linux-t2-patches"
 CONFIG_FILE="${PVE_DIR}/debian/rules.d/config-amd64.opts"
 
-SKIPPED_PATCH="2008-i915-4-lane-quirk-for-mbp15-1.patch"
+# Minimal T2 patchset required for Apple SMC / thermal sensors /
+# fan support on Mac mini 2018 (Macmini8,1).
+MACMINI_T2_PATCHES=(
+  "3001-applesmc-convert-static-structures-to-drvdata.patch"
+  "3002-applesmc-make-io-port-base-addr-dynamic.patch"
+  "3003-applesmc-switch-to-acpi_device-from-platform.patch"
+  "3004-applesmc-key-interface-wrappers.patch"
+  "3005-applesmc-basic-mmio-interface-implementation.patch"
+  "3006-applesmc-fan-support-on-T2-Macs.patch"
+)
 
 if [[ -z "${PVE_SHA:-}" ]]; then
   echo "ERROR: PVE_SHA is not defined" >&2
@@ -35,8 +44,13 @@ if [[ ! -d "${T2_DIR}/.git" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  echo "ERROR: Proxmox amd64 configuration file is missing" >&2
+  exit 1
+fi
+
 echo "Target model: ${TARGET_MODEL}"
-echo "Preparing T2 build tree..."
+echo "Preparing minimal T2 build tree..."
 
 ACTUAL_PVE_SHA="$(git -C "${PVE_DIR}" rev-parse HEAD)"
 ACTUAL_T2_SHA="$(git -C "${T2_DIR}" rev-parse HEAD)"
@@ -55,35 +69,26 @@ if [[ "${ACTUAL_T2_SHA}" != "${T2_SHA}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${T2_DIR}/extra_config" ]]; then
-  echo "ERROR: T2 extra_config is missing" >&2
-  exit 1
-fi
-
-if [[ ! -f "${CONFIG_FILE}" ]]; then
-  echo "ERROR: Proxmox amd64 configuration file is missing" >&2
-  exit 1
-fi
+#
+# Stage only the patches required for Macmini8,1.
+#
 
 rm -f "${PVE_DIR}"/patches/kernel/t2-*.patch
 
 T2_PATCH_COUNT=0
 
-for patchfile in "${T2_DIR}"/*.patch; do
-  [[ -e "${patchfile}" ]] || continue
+for PATCH_NAME in "${MACMINI_T2_PATCHES[@]}"; do
+  PATCH_SOURCE="${T2_DIR}/${PATCH_NAME}"
 
-  PATCH_NAME="$(basename "${patchfile}")"
-
-  if [[ "${PATCH_NAME}" == "${SKIPPED_PATCH}" ]]; then
-    echo "T2 SKIP -> ${PATCH_NAME}"
-    echo "Reason: MacBookPro15,1-specific; not applicable to ${TARGET_MODEL}"
-    continue
+  if [[ ! -f "${PATCH_SOURCE}" ]]; then
+    echo "ERROR: required T2 patch is missing: ${PATCH_NAME}" >&2
+    exit 1
   fi
 
   echo "T2 STAGE -> ${PATCH_NAME}"
 
   cp \
-    "${patchfile}" \
+    "${PATCH_SOURCE}" \
     "${PVE_DIR}/patches/kernel/t2-${PATCH_NAME}"
 
   T2_PATCH_COUNT=$((T2_PATCH_COUNT + 1))
@@ -95,6 +100,10 @@ if [[ "${T2_PATCH_COUNT}" -ne "${EXPECTED_PATCH_COUNT}" ]]; then
   echo "Staged:   ${T2_PATCH_COUNT}"
   exit 1
 fi
+
+#
+# Give the custom kernel an explicit suffix.
+#
 
 if ! grep -Fqx \
   'EXTRAVERSION=-$(KREL)$(KREL_EXTRA)-pve' \
@@ -116,57 +125,26 @@ then
   exit 1
 fi
 
-T2_CONFIG_OPTS="/tmp/t2-config.opts"
-: > "${T2_CONFIG_OPTS}"
-
-T2_CONFIG_COUNT=0
-
-while IFS='=' read -r KEY VALUE || [[ -n "${KEY:-}" ]]; do
-  [[ -n "${KEY:-}" ]] || continue
-  [[ "${KEY}" == \#* ]] && continue
-
-  if [[ ! "${KEY}" =~ ^CONFIG_[A-Z0-9_]+$ ]]; then
-    echo "ERROR: invalid T2 config entry: ${KEY}" >&2
-    exit 1
-  fi
-
-  SYMBOL="${KEY#CONFIG_}"
-
-  case "${VALUE}" in
-    y)
-      ACTION="-e"
-      ;;
-    m)
-      ACTION="-m"
-      ;;
-    n)
-      ACTION="-d"
-      ;;
-    *)
-      echo "ERROR: unsupported T2 config value: ${KEY}=${VALUE}" >&2
-      exit 1
-      ;;
-  esac
-
-  printf '%s %s\n' \
-    "${ACTION}" \
-    "${SYMBOL}" \
-    >> "${T2_CONFIG_OPTS}"
-
-  T2_CONFIG_COUNT=$((T2_CONFIG_COUNT + 1))
-done < "${T2_DIR}/extra_config"
-
-if [[ "${T2_CONFIG_COUNT}" -eq 0 ]]; then
-  echo "ERROR: no T2 kernel configuration found" >&2
-  exit 1
-fi
+#
+# Minimal kernel configuration.
+#
+# Do NOT import the complete T2Linux extra_config:
+# it enables BCE, GMUX, Touch Bar, APFS and other components
+# which are not required for this Macmini8,1 Proxmox target.
+#
 
 {
   echo
   echo "# BEGIN pve-t2-kernel configuration for ${TARGET_MODEL}"
-  cat "${T2_CONFIG_OPTS}"
+  echo "-m SENSORS_APPLESMC"
   echo "# END pve-t2-kernel configuration for ${TARGET_MODEL}"
 } >> "${CONFIG_FILE}"
+
+T2_CONFIG_COUNT=1
+
+#
+# Final consistency checks.
+#
 
 STAGED_COUNT="$(
   find "${PVE_DIR}/patches/kernel" \
@@ -182,12 +160,12 @@ if [[ "${STAGED_COUNT}" -ne "${T2_PATCH_COUNT}" ]]; then
 fi
 
 echo
-echo "T2 build integration ready."
+echo "Minimal T2 build integration ready."
 echo "Target:             ${TARGET_MODEL}"
 echo "T2 patches staged:  ${T2_PATCH_COUNT}"
 echo "T2 config options:  ${T2_CONFIG_COUNT}"
 echo "Kernel suffix:      -pve-t2"
-echo "Excluded patch:     ${SKIPPED_PATCH}"
+echo "Patch profile:      AppleSMC / sensors / fan only"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "target=${TARGET_MODEL}" >> "${GITHUB_OUTPUT}"
@@ -199,12 +177,11 @@ fi
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
   cat >> "${GITHUB_STEP_SUMMARY}" <<EOF
 
-## T2 build integration
+## Minimal T2 build integration
 - Target hardware: \`${TARGET_MODEL}\`
 - T2 patches staged: \`${T2_PATCH_COUNT}\`
 - T2 configuration directives: \`${T2_CONFIG_COUNT}\`
 - Kernel suffix: \`-pve-t2\`
-- Excluded patch: \`${SKIPPED_PATCH}\`
-- Exclusion reason: MacBookPro15,1-specific, not applicable to \`${TARGET_MODEL}\`
+- T2 profile: AppleSMC / thermal sensors / fan support only
 EOF
 fi
