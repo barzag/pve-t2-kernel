@@ -3,14 +3,25 @@
 set -euo pipefail
 
 PVE_DIR="proxmox-pve-kernel"
-T2_DIR="linux-t2-patches"
 
 TARGET_MODEL="Macmini8,1"
 
 CONFIG_FILE="${PVE_DIR}/debian/rules.d/config-amd64.opts"
 
-if [[ ! -f "${T2_DIR}/extra_config" ]]; then
-  echo "ERROR: T2 extra_config is missing" >&2
+#
+# Minimal Macmini8,1 T2 kernel configuration.
+#
+# The selected T2 patch profile only modifies the Apple SMC driver.
+# BCE, GMUX, Touch Bar, APFS, audio and other generic T2 options are
+# intentionally not enabled for this Proxmox server target.
+#
+
+REQUIRED_CONFIG_OPTS=(
+  "-m SENSORS_APPLESMC"
+)
+
+if [[ ! -d "${PVE_DIR}/.git" ]]; then
+  echo "ERROR: ${PVE_DIR} repository is missing" >&2
   exit 1
 fi
 
@@ -18,6 +29,16 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   echo "ERROR: Proxmox amd64 configuration file is missing" >&2
   exit 1
 fi
+
+if [[ ! -f "${PVE_DIR}/Makefile" ]]; then
+  echo "ERROR: Proxmox Makefile is missing" >&2
+  exit 1
+fi
+
+#
+# Ensure that prepare-integration.sh will be able to apply
+# the custom kernel suffix to the unmodified Proxmox tree.
+#
 
 if ! grep -Fqx \
   'EXTRAVERSION=-$(KREL)$(KREL_EXTRA)-pve' \
@@ -27,38 +48,40 @@ then
   exit 1
 fi
 
+#
+# Validate the minimal configuration directives.
+#
+
 CONFIG_COUNT=0
 
-while IFS='=' read -r KEY VALUE || [[ -n "${KEY:-}" ]]; do
-  [[ -n "${KEY:-}" ]] || continue
-  [[ "${KEY}" == \#* ]] && continue
+for CONFIG_OPT in "${REQUIRED_CONFIG_OPTS[@]}"; do
 
-  if [[ ! "${KEY}" =~ ^CONFIG_[A-Z0-9_]+$ ]]; then
-    echo "ERROR: invalid T2 config entry: ${KEY}" >&2
+  if [[ ! "${CONFIG_OPT}" =~ ^-(e|m|d)[[:space:]][A-Z0-9_]+$ ]]; then
+    echo "ERROR: invalid kernel configuration directive: ${CONFIG_OPT}" >&2
     exit 1
   fi
 
-  case "${VALUE}" in
-    y|m|n)
-      ;;
-    *)
-      echo "ERROR: unsupported T2 config value: ${KEY}=${VALUE}" >&2
-      exit 1
-      ;;
-  esac
-
   CONFIG_COUNT=$((CONFIG_COUNT + 1))
-done < "${T2_DIR}/extra_config"
+done
 
-if [[ "${CONFIG_COUNT}" -eq 0 ]]; then
-  echo "ERROR: no T2 kernel configuration found" >&2
+if [[ "${CONFIG_COUNT}" -ne 1 ]]; then
+  echo "ERROR: unexpected Macmini8,1 configuration count" >&2
+  echo "Expected: 1"
+  echo "Actual:   ${CONFIG_COUNT}"
+  exit 1
+fi
+
+if [[ "${REQUIRED_CONFIG_OPTS[0]}" != "-m SENSORS_APPLESMC" ]]; then
+  echo "ERROR: unexpected Macmini8,1 kernel configuration" >&2
   exit 1
 fi
 
 echo
-echo "T2 integration inputs validated."
+echo "Minimal T2 integration inputs validated."
 echo "Target:             ${TARGET_MODEL}"
+echo "T2 profile:         AppleSMC / sensors / fan only"
 echo "T2 config entries:  ${CONFIG_COUNT}"
+echo "Kernel option:       ${REQUIRED_CONFIG_OPTS[0]}"
 echo "Kernel suffix input: compatible"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
