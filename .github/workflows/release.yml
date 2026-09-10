@@ -182,13 +182,38 @@ jobs:
           echo "digest=${ARTIFACT_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Download existing build artifact
-        uses: actions/download-artifact@v8
-        with:
-          artifact-ids: ${{ steps.artifact.outputs.id }}
-          path: release-assets
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ inputs.run_id }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+        run: |
+          set -euo pipefail
+
+          rm -rf release-assets artifact.zip
+          mkdir -p release-assets
+
+          echo "Downloading artifact ${ARTIFACT_ID}..."
+
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -o artifact.zip
+
+          echo "Extracting artifact..."
+
+          python3 -m zipfile -e \
+            artifact.zip \
+            release-assets
+
+          rm -f artifact.zip
+
+          echo "Artifact downloaded and extracted."
 
       - name: Validate downloaded packages
         id: packages
