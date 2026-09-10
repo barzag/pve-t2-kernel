@@ -31,6 +31,14 @@ jobs:
         run: |
           bash scripts/resolve-proxmox.sh
 
+      - name: Resolve T2 patch candidate
+        id: t2
+        shell: bash
+        env:
+          PVE_KERNEL: ${{ steps.pve_repo.outputs.kernel }}
+        run: |
+          bash scripts/resolve-t2.sh
+          
       - name: Validate T2 patch application
         id: compat
         shell: bash
