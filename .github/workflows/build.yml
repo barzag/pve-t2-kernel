@@ -12,6 +12,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4    
       - name: Discover latest published Proxmox kernel
         id: pve_repo
         shell: bash
