@@ -2,14 +2,27 @@ name: Build T2 kernel
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+
+concurrency:
+  group: t2-kernel-build-and-release
+  cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
   discover:
-    name: Discover upstream revisions
+    name: Discover and build changed upstream revisions
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.candidate.outputs.changed }}
+      tag: ${{ steps.candidate.outputs.tag }}
+      kernel: ${{ steps.pve_repo.outputs.kernel }}
+      pve_sha: ${{ steps.pve.outputs.sha }}
+      t2_sha: ${{ steps.t2.outputs.sha }}
 
     steps:
       - name: Checkout repository
@@ -38,7 +51,49 @@ jobs:
         run: |
           bash scripts/resolve-t2.sh
 
+      - name: Check whether these sources are already published
+        id: candidate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PVE_SHA: ${{ steps.pve.outputs.sha }}
+          T2_SHA: ${{ steps.t2.outputs.sha }}
+          KERNEL_VERSION: ${{ steps.pve_repo.outputs.kernel }}
+          PACKAGE_VERSION: ${{ steps.pve_repo.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, urllib.error, urllib.request
+          e = os.environ
+          # Include the build recipe, but ignore unrelated documentation commits.
+          recipe = subprocess.check_output([
+              'git', 'rev-parse', 'HEAD:scripts', 'HEAD:.github/workflows/build.yml'
+          ]).decode()
+          identity = '\n'.join([e['PVE_SHA'], e['T2_SHA'], e['PACKAGE_VERSION'], recipe])
+          digest = hashlib.sha256(identity.encode()).hexdigest()
+          tag = f"auto-{e['KERNEL_VERSION']}-pve-t2-{digest}"
+          request = urllib.request.Request(
+              f"https://api.github.com/repos/{e['GITHUB_REPOSITORY']}/releases/tags/{tag}",
+              headers={'Authorization': 'Bearer ' + e['GH_TOKEN'],
+                       'Accept': 'application/vnd.github+json'})
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  release = json.load(response)
+              changed = release['draft']
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+              changed = True
+          with open(e['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"tag={tag}\nchanged={str(changed).lower()}\n")
+          with open(e['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write(f"Candidate: `{tag}`\n\n")
+              summary.write('New or unpublished sources: build required.\n' if changed
+                            else 'Already published: compilation and publication skipped.\n')
+          PY
+
       - name: Test T2 patch application
+        if: steps.candidate.outputs.changed == 'true'
         id: compat
         shell: bash
         env:
@@ -48,6 +103,7 @@ jobs:
           bash scripts/validate-patches.sh
 
       - name: Prepare T2 build tree for Macmini8,1
+        if: steps.candidate.outputs.changed == 'true'
         id: integrate
         shell: bash
         env:
@@ -58,6 +114,7 @@ jobs:
           bash scripts/prepare-integration.sh
 
       - name: Build Macmini8,1 T2 kernel
+        if: steps.candidate.outputs.changed == 'true'
         id: build
         shell: bash
         run: |
@@ -251,6 +308,7 @@ jobs:
             '
 
       - name: Validate generated T2 packages
+        if: steps.candidate.outputs.changed == 'true'
         id: packages
         shell: bash
         env:
@@ -260,6 +318,7 @@ jobs:
           bash scripts/validate-packages.sh
 
       - name: Upload T2 kernel artifacts
+        if: steps.candidate.outputs.changed == 'true'
         id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
@@ -316,3 +375,106 @@ jobs:
           - Package validation: `${{ steps.packages.outcome }}`
           - Artifact upload: `${{ steps.upload.outcome }}`
           EOF
+
+  publish:
+    name: Publish validated kernel prerelease
+    needs: discover
+    if: needs.discover.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.discover.outputs.tag }}
+      KERNEL_VERSION: ${{ needs.discover.outputs.kernel }}
+      PVE_SHA: ${{ needs.discover.outputs.pve_sha }}
+      T2_SHA: ${{ needs.discover.outputs.t2_sha }}
+    steps:
+      - name: Download validated packages from this run
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" \
+            --name "pve-t2-${KERNEL_VERSION}-macmini8-1" \
+            --dir release-assets
+
+      - name: Verify packages and prepare portable checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, os, pathlib, re, subprocess
+          root = pathlib.Path('release-assets')
+          files = list(root.iterdir())
+          assert len(files) == 3 and all(p.is_file() for p in files), 'Expected exactly three files'
+          kernel = list(root.glob('proxmox-kernel-*-pve-t2_*.deb'))
+          headers = list(root.glob('proxmox-headers-*-pve-t2_*.deb'))
+          assert len(kernel) == len(headers) == 1, 'Expected kernel and headers'
+          packages = kernel + headers
+          sums = root / 'SHA256SUMS'
+          expected = {}
+          for line in sums.read_text().splitlines():
+              digest, name = line.split(maxsplit=1)
+              name = pathlib.PurePosixPath(name).name
+              assert re.fullmatch(r'[0-9a-f]{64}', digest) and name not in expected
+              expected[name] = digest
+          assert set(expected) == {p.name for p in packages}, 'Invalid checksum coverage'
+          versions = []
+          for p, prefix in zip(packages, ['proxmox-kernel-', 'proxmox-headers-']):
+              assert hashlib.sha256(p.read_bytes()).hexdigest() == expected[p.name], 'Checksum mismatch'
+              name, version, arch = subprocess.check_output([
+                  'dpkg-deb', '-W', '--showformat=${Package}\t${Version}\t${Architecture}', str(p)
+              ], text=True).split('\t')
+              assert name == prefix + os.environ['KERNEL_VERSION'] + '-pve-t2'
+              assert arch == 'amd64'
+              versions.append(version)
+          assert versions[0] == versions[1], 'Kernel/header version mismatch'
+          # Users can run sha256sum -c SHA256SUMS beside the downloaded packages.
+          sums.write_text(''.join(f'{expected[p.name]}  {p.name}\n' for p in packages))
+          e = os.environ
+          pathlib.Path('release-notes.md').write_text(
+              f"Proxmox kernel {e['KERNEL_VERSION']}-pve-t2 for Macmini8,1\n\n"
+              'Automatically compiled and package-validated. Hardware boot, thermal sensors '
+              'and fan operation have NOT been validated by this workflow.\n\n'
+              'Profile: AppleSMC / sensors / fan only; not the complete T2 patchset.\n\n'
+              f"Proxmox source: {e['PVE_SHA']}\n\nT2 source: {e['T2_SHA']}\n\n"
+              f"Build recipe commit: {e['GITHUB_SHA']}\n\n"
+              f"Build: https://github.com/{e['GITHUB_REPOSITORY']}/actions/runs/{e['GITHUB_RUN_ID']}\n\n"
+              'Assets: kernel, matching headers and SHA256SUMS. '
+              'Verify with `sha256sum -c SHA256SUMS`. Keep a working kernel for rollback.\n'
+          )
+          PY
+
+      - name: Stage assets then publish prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Only a genuine 404 means missing; API/authentication errors must fail.
+          STATUS="$(curl --silent --show-error --output release.json --write-out '%{http_code}' \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${GH_REPO}/releases/tags/${RELEASE_TAG}")"
+          case "$STATUS" in
+            200)
+              if [[ "$(jq -r '.draft' release.json)" != true ]]; then
+                echo 'This release is already published; keeping existing assets.'
+                exit 0
+              fi
+              ;;
+            404)
+              gh release create "$RELEASE_TAG" --draft --prerelease --latest=false \
+                --target "$GITHUB_SHA" \
+                --title "Proxmox ${KERNEL_VERSION} T2 — Macmini8,1" \
+                --notes-file release-notes.md
+              ;;
+            *) echo "ERROR: release lookup returned HTTP ${STATUS}"; exit 1 ;;
+          esac
+          # Resume an incomplete draft if a previous upload failed.
+          gh release upload "$RELEASE_TAG" release-assets/* --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false \
+            --notes-file release-notes.md
+          printf 'Published prerelease: https://github.com/%s/releases/tag/%s\n' \
+            "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
