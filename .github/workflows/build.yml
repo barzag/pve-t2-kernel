@@ -1,0 +1,884 @@
+name: Bootstrap upstream discovery
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - bootstrap-ci
+    paths:
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Discover upstream revisions
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Discover latest published Proxmox kernel
+        id: pve_repo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RESULT="$(
+            docker run --rm debian:trixie bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              apt-get update -qq
+              apt-get install -y -qq ca-certificates curl >/dev/null
+
+              curl \
+                --fail \
+                --location \
+                --silent \
+                --show-error \
+                https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
+                -o /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+              cat > /etc/apt/sources.list.d/proxmox.sources <<EOF
+          Types: deb
+          URIs: http://download.proxmox.com/debian/pve
+          Suites: trixie
+          Components: pve-no-subscription
+          Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+          EOF
+
+              apt-get update -qq
+
+              PACKAGE="$(
+                apt-cache pkgnames |
+                grep -E "^proxmox-kernel-[0-9].*-pve$" |
+                sort -V |
+                tail -n 1
+              )"
+
+              if [ -z "${PACKAGE}" ]; then
+                echo "ERROR: no Proxmox kernel package found" >&2
+                exit 1
+              fi
+
+              VERSION="$(
+                apt-cache policy "${PACKAGE}" |
+                awk "/Candidate:/ {print \$2; exit}"
+              )"
+
+              KERNEL="$(
+                printf "%s\n" "${PACKAGE}" |
+                sed -E "s/^proxmox-kernel-(.*)-pve$/\1/"
+              )"
+
+              printf "%s|%s|%s\n" \
+                "${PACKAGE}" \
+                "${KERNEL}" \
+                "${VERSION}"
+            '
+          )"
+
+          IFS='|' read -r LATEST_PACKAGE LATEST_KERNEL LATEST_VERSION <<< "$RESULT"
+
+          echo "Latest published package: ${LATEST_PACKAGE}"
+          echo "Latest published kernel:  ${LATEST_KERNEL}"
+          echo "Debian package version:    ${LATEST_VERSION}"
+
+          echo "package=${LATEST_PACKAGE}" >> "$GITHUB_OUTPUT"
+          echo "kernel=${LATEST_KERNEL}" >> "$GITHUB_OUTPUT"
+          echo "version=${LATEST_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve published Proxmox source commit
+        id: pve
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBLISHED_KERNEL="${{ steps.pve_repo.outputs.kernel }}"
+          PUBLISHED_VERSION="${{ steps.pve_repo.outputs.version }}"
+
+          echo "Published kernel:  ${PUBLISHED_KERNEL}"
+          echo "Published version: ${PUBLISHED_VERSION}"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/proxmox/pve-kernel.git \
+            proxmox-pve-kernel
+
+          cd proxmox-pve-kernel
+
+          EXPECTED_SUBJECT="update ABI file for ${PUBLISHED_KERNEL}-pve (amd64)"
+
+          PVE_SHA="$(
+            git log origin/master \
+              --format='%H%x09%s' |
+            awk -F '\t' -v expected="${EXPECTED_SUBJECT}" '
+              $2 == expected && !found {
+                print $1
+                found=1
+              }
+            '
+          )"
+
+          if [[ -z "${PVE_SHA}" ]]; then
+            echo "ERROR: unable to resolve published Proxmox source commit"
+            exit 1
+          fi
+
+          PVE_SUBJECT="$(git show -s --format=%s "${PVE_SHA}")"
+
+          PVE_CHANGELOG="$(
+            git show "${PVE_SHA}:debian/changelog" |
+            sed -n '1p'
+          )"
+
+          if ! grep -Fq "(${PUBLISHED_VERSION}) " <<< "${PVE_CHANGELOG}"; then
+            echo "ERROR: resolved Git commit does not match published package version"
+            exit 1
+          fi
+
+          echo "Resolved Proxmox source:"
+          echo "SHA:       ${PVE_SHA}"
+          echo "Commit:    ${PVE_SUBJECT}"
+          echo "Changelog: ${PVE_CHANGELOG}"
+
+          echo "sha=${PVE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=master" >> "$GITHUB_OUTPUT"
+          echo "subject=${PVE_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "changelog=${PVE_CHANGELOG}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve T2 patch candidate
+        id: t2
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PVE_KERNEL="${{ steps.pve_repo.outputs.kernel }}"
+
+          PVE_SERIES="$(
+            printf '%s\n' "${PVE_KERNEL}" |
+            sed -E 's/^([0-9]+\.[0-9]+).*/\1/'
+          )"
+
+          echo "Proxmox kernel: ${PVE_KERNEL}"
+          echo "Required T2 series: ${PVE_SERIES}"
+
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/t2linux/linux-t2-patches.git \
+            linux-t2-patches
+
+          cd linux-t2-patches
+
+          T2_SHA=""
+
+          while read -r COMMIT; do
+            KVER="$(
+              git show "${COMMIT}:version" 2>/dev/null |
+              sed -n 's/^KVER=//p' |
+              tr -d '\r\n' ||
+              true
+            )"
+
+            [[ -n "${KVER}" ]] || continue
+
+            T2_SERIES="$(
+              printf '%s\n' "${KVER}" |
+              sed -E 's/^([0-9]+\.[0-9]+).*/\1/'
+            )"
+
+            if [[ "${T2_SERIES}" == "${PVE_SERIES}" ]]; then
+              T2_SHA="${COMMIT}"
+              T2_KVER="${KVER}"
+              break
+            fi
+          done < <(git rev-list origin/main)
+
+          if [[ -z "${T2_SHA}" ]]; then
+            echo "ERROR: no T2 candidate found for ${PVE_SERIES}"
+            exit 1
+          fi
+
+          T2_SUBJECT="$(git show -s --format=%s "${T2_SHA}")"
+
+          echo "Resolved T2 candidate:"
+          echo "SHA:    ${T2_SHA}"
+          echo "KVER:   ${T2_KVER}"
+          echo "Commit: ${T2_SUBJECT}"
+
+          echo "sha=${T2_SHA}" >> "$GITHUB_OUTPUT"
+          echo "branch=main" >> "$GITHUB_OUTPUT"
+          echo "subject=${T2_SUBJECT}" >> "$GITHUB_OUTPUT"
+          echo "kver=KVER=${T2_KVER}" >> "$GITHUB_OUTPUT"
+
+      - name: Test T2 patch application
+        id: compat
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+
+          PVE_SHA="${{ steps.pve.outputs.sha }}"
+          T2_SHA="${{ steps.t2.outputs.sha }}"
+
+          SKIPPED_PATCH="2008-i915-4-lane-quirk-for-mbp15-1.patch"
+
+          echo "Testing compatibility:"
+          echo "Proxmox SHA: ${PVE_SHA}"
+          echo "T2 SHA:      ${T2_SHA}"
+
+          cd proxmox-pve-kernel
+
+          git checkout --detach "${PVE_SHA}"
+
+          git config \
+            submodule.submodules/ubuntu-kernel.url \
+            https://git.proxmox.com/git/mirror_ubuntu-kernels.git
+
+          git submodule update \
+            --init \
+            --depth 1 \
+            submodules/ubuntu-kernel
+
+          cd ..
+
+          cd linux-t2-patches
+          git checkout --detach "${T2_SHA}"
+          cd ..
+
+          rm -rf kernel-compat
+
+          cp -a \
+            proxmox-pve-kernel/submodules/ubuntu-kernel \
+            kernel-compat
+
+          rm -rf \
+            kernel-compat/debian \
+            kernel-compat/debian.master
+
+          cd kernel-compat
+
+          echo "Applying official Proxmox patches..."
+
+          for patchfile in ../proxmox-pve-kernel/patches/kernel/*.patch; do
+            PATCH_NAME="$(basename "${patchfile}")"
+
+            echo "PVE -> ${PATCH_NAME}"
+
+            if ! patch \
+              --batch \
+              -p1 \
+              < "${patchfile}" \
+              > /tmp/pve-patch.log 2>&1
+            then
+              cat /tmp/pve-patch.log
+              echo "ERROR: official Proxmox patch failed: ${PATCH_NAME}"
+              exit 1
+            fi
+          done
+
+          echo "Applying T2 candidate patches..."
+
+          T2_COUNT=0
+          T2_SKIPPED=0
+
+          for patchfile in ../linux-t2-patches/*.patch; do
+            [[ -e "${patchfile}" ]] || continue
+
+            PATCH_NAME="$(basename "${patchfile}")"
+
+            if [[ "${PATCH_NAME}" == "${SKIPPED_PATCH}" ]]; then
+              echo "T2 SKIP -> ${PATCH_NAME}"
+              echo "Reason: model-specific MBP15,1 i915 patch requires separate validation"
+
+              T2_SKIPPED=$((T2_SKIPPED + 1))
+              continue
+            fi
+
+            echo "T2 -> ${PATCH_NAME}"
+
+            if ! patch \
+              --batch \
+              -p1 \
+              < "${patchfile}" \
+              > /tmp/t2-apply.log 2>&1
+            then
+              cat /tmp/t2-apply.log
+
+              echo "compatible=false" >> "$GITHUB_OUTPUT"
+              echo "failed_patch=${PATCH_NAME}" >> "$GITHUB_OUTPUT"
+              echo "patch_count=${T2_COUNT}" >> "$GITHUB_OUTPUT"
+              echo "skipped_count=${T2_SKIPPED}" >> "$GITHUB_OUTPUT"
+              echo "skipped_patch=${SKIPPED_PATCH}" >> "$GITHUB_OUTPUT"
+
+              echo "ERROR: T2 patch failed during real application: ${PATCH_NAME}"
+              exit 1
+            fi
+
+            T2_COUNT=$((T2_COUNT + 1))
+          done
+
+          if [[ "${T2_COUNT}" -eq 0 ]]; then
+            echo "ERROR: no T2 patches applied"
+            exit 1
+          fi
+
+          echo "compatible=true" >> "$GITHUB_OUTPUT"
+          echo "patch_count=${T2_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=${T2_SKIPPED}" >> "$GITHUB_OUTPUT"
+          echo "skipped_patch=${SKIPPED_PATCH}" >> "$GITHUB_OUTPUT"
+
+          echo "T2 compatibility baseline passed."
+          echo "Applied patches: ${T2_COUNT}"
+          echo "Skipped patches: ${T2_SKIPPED}"
+      - name: Prepare T2 build tree for Macmini8,1
+        id: integrate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_MODEL="Macmini8,1"
+
+          PVE_DIR="proxmox-pve-kernel"
+          T2_DIR="linux-t2-patches"
+          CONFIG_FILE="${PVE_DIR}/debian/rules.d/config-amd64.opts"
+
+          EXPECTED_PVE_SHA="${{ steps.pve.outputs.sha }}"
+          EXPECTED_T2_SHA="${{ steps.t2.outputs.sha }}"
+          EXPECTED_PATCH_COUNT="${{ steps.compat.outputs.patch_count }}"
+
+          SKIPPED_PATCH="2008-i915-4-lane-quirk-for-mbp15-1.patch"
+
+          echo "Target model: ${TARGET_MODEL}"
+          echo "Preparing T2 build tree..."
+
+          #
+          # Verify that we are still working from the exact sources
+          # validated during the previous steps.
+          #
+
+          ACTUAL_PVE_SHA="$(git -C "${PVE_DIR}" rev-parse HEAD)"
+          ACTUAL_T2_SHA="$(git -C "${T2_DIR}" rev-parse HEAD)"
+
+          if [[ "${ACTUAL_PVE_SHA}" != "${EXPECTED_PVE_SHA}" ]]; then
+            echo "ERROR: unexpected Proxmox source SHA"
+            echo "Expected: ${EXPECTED_PVE_SHA}"
+            echo "Actual:   ${ACTUAL_PVE_SHA}"
+            exit 1
+          fi
+
+          if [[ "${ACTUAL_T2_SHA}" != "${EXPECTED_T2_SHA}" ]]; then
+            echo "ERROR: unexpected T2 source SHA"
+            echo "Expected: ${EXPECTED_T2_SHA}"
+            echo "Actual:   ${ACTUAL_T2_SHA}"
+            exit 1
+          fi
+
+          if [[ ! -f "${T2_DIR}/extra_config" ]]; then
+            echo "ERROR: T2 extra_config is missing"
+            exit 1
+          fi
+
+          #
+          # Copy the T2 patches validated by the compatibility test
+          # into the normal Proxmox kernel patch chain.
+          #
+          # Patch 2008 is intentionally excluded:
+          # it targets MacBookPro15,1 and is not applicable to Macmini8,1.
+          #
+
+          rm -f "${PVE_DIR}"/patches/kernel/t2-*.patch
+
+          T2_PATCH_COUNT=0
+
+          for patchfile in "${T2_DIR}"/*.patch; do
+            [[ -e "${patchfile}" ]] || continue
+
+            PATCH_NAME="$(basename "${patchfile}")"
+
+            if [[ "${PATCH_NAME}" == "${SKIPPED_PATCH}" ]]; then
+              echo "T2 SKIP -> ${PATCH_NAME}"
+              echo "Reason: MacBookPro15,1-specific; not applicable to ${TARGET_MODEL}"
+              continue
+            fi
+
+            echo "T2 STAGE -> ${PATCH_NAME}"
+
+            cp \
+              "${patchfile}" \
+              "${PVE_DIR}/patches/kernel/t2-${PATCH_NAME}"
+
+            T2_PATCH_COUNT=$((T2_PATCH_COUNT + 1))
+          done
+
+          if [[ "${T2_PATCH_COUNT}" -ne "${EXPECTED_PATCH_COUNT}" ]]; then
+            echo "ERROR: T2 staged patch count mismatch"
+            echo "Expected: ${EXPECTED_PATCH_COUNT}"
+            echo "Staged:   ${T2_PATCH_COUNT}"
+            exit 1
+          fi
+
+          #
+          # Give our kernel a distinct name so it can coexist
+          # with the official Proxmox kernel.
+          #
+
+          if ! grep -Fqx \
+            'EXTRAVERSION=-$(KREL)$(KREL_EXTRA)-pve' \
+            "${PVE_DIR}/Makefile"
+          then
+            echo "ERROR: expected Proxmox EXTRAVERSION was not found"
+            exit 1
+          fi
+
+          sed -i \
+            's|EXTRAVERSION=-$(KREL)$(KREL_EXTRA)-pve|EXTRAVERSION=-$(KREL)$(KREL_EXTRA)-pve-t2|' \
+            "${PVE_DIR}/Makefile"
+
+          if ! grep -Fqx \
+            'EXTRAVERSION=-$(KREL)$(KREL_EXTRA)-pve-t2' \
+            "${PVE_DIR}/Makefile"
+          then
+            echo "ERROR: unable to set pve-t2 kernel suffix"
+            exit 1
+          fi
+
+          #
+          # Convert t2linux extra_config to the syntax expected
+          # by Proxmox scripts/config.
+          #
+
+          T2_CONFIG_OPTS="/tmp/t2-config.opts"
+          : > "${T2_CONFIG_OPTS}"
+
+          T2_CONFIG_COUNT=0
+
+          while IFS='=' read -r KEY VALUE || [[ -n "${KEY:-}" ]]; do
+            [[ -n "${KEY:-}" ]] || continue
+            [[ "${KEY}" == \#* ]] && continue
+
+            if [[ ! "${KEY}" =~ ^CONFIG_[A-Z0-9_]+$ ]]; then
+              echo "ERROR: invalid T2 config entry: ${KEY}"
+              exit 1
+            fi
+
+            SYMBOL="${KEY#CONFIG_}"
+
+            case "${VALUE}" in
+              y)
+                ACTION="-e"
+                ;;
+              m)
+                ACTION="-m"
+                ;;
+              n)
+                ACTION="-d"
+                ;;
+              *)
+                echo "ERROR: unsupported T2 config value: ${KEY}=${VALUE}"
+                exit 1
+                ;;
+            esac
+
+            printf '%s %s\n' \
+              "${ACTION}" \
+              "${SYMBOL}" \
+              >> "${T2_CONFIG_OPTS}"
+
+            T2_CONFIG_COUNT=$((T2_CONFIG_COUNT + 1))
+          done < "${T2_DIR}/extra_config"
+
+          if [[ "${T2_CONFIG_COUNT}" -eq 0 ]]; then
+            echo "ERROR: no T2 kernel configuration found"
+            exit 1
+          fi
+
+          #
+          # Append T2 requirements after the normal Proxmox
+          # amd64 configuration so they take precedence.
+          #
+
+          {
+            echo
+            echo "# BEGIN pve-t2-kernel configuration for ${TARGET_MODEL}"
+            cat "${T2_CONFIG_OPTS}"
+            echo "# END pve-t2-kernel configuration for ${TARGET_MODEL}"
+          } >> "${CONFIG_FILE}"
+
+          #
+          # Final validation.
+          #
+
+          STAGED_COUNT="$(
+            find "${PVE_DIR}/patches/kernel" \
+              -maxdepth 1 \
+              -type f \
+              -name 't2-*.patch' |
+            wc -l
+          )"
+
+          if [[ "${STAGED_COUNT}" -ne "${T2_PATCH_COUNT}" ]]; then
+            echo "ERROR: final T2 patch count mismatch"
+            exit 1
+          fi
+
+          echo
+          echo "T2 build integration ready."
+          echo "Target:             ${TARGET_MODEL}"
+          echo "T2 patches staged:  ${T2_PATCH_COUNT}"
+          echo "T2 config options:  ${T2_CONFIG_COUNT}"
+          echo "Kernel suffix:       -pve-t2"
+          echo "Excluded patch:      ${SKIPPED_PATCH}"
+
+          echo "target=${TARGET_MODEL}" >> "$GITHUB_OUTPUT"
+          echo "patch_count=${T2_PATCH_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "config_count=${T2_CONFIG_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "suffix=pve-t2" >> "$GITHUB_OUTPUT"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+          ## T2 build integration
+          - Target hardware: \`${TARGET_MODEL}\`
+          - T2 patches staged: \`${T2_PATCH_COUNT}\`
+          - T2 configuration directives: \`${T2_CONFIG_COUNT}\`
+          - Kernel suffix: \`-pve-t2\`
+          - Excluded patch: \`${SKIPPED_PATCH}\`
+          - Exclusion reason: MacBookPro15,1-specific, not applicable to \`${TARGET_MODEL}\`
+          EOF
+
+      - name: Build Macmini8,1 T2 kernel
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PVE_DIR="proxmox-pve-kernel"
+          KERNEL_VERSION="${{ steps.pve_repo.outputs.kernel }}"
+
+          echo "Starting first real T2 kernel build"
+          echo "Target:  Macmini8,1"
+          echo "Kernel:  ${KERNEL_VERSION}-pve-t2"
+
+          #
+          # Free disk space on the ephemeral GitHub runner.
+          #
+
+          echo "Disk space before cleanup:"
+          df -h /
+
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /usr/local/.ghcup \
+            2>/dev/null || true
+
+          docker image prune -af >/dev/null 2>&1 || true
+
+          echo "Disk space after cleanup:"
+          df -h /
+
+          #
+          # Pin both Proxmox submodules to their official sources.
+          #
+
+          git -C "${PVE_DIR}" config \
+            submodule.submodules/ubuntu-kernel.url \
+            https://git.proxmox.com/git/mirror_ubuntu-kernels.git
+
+          git -C "${PVE_DIR}" config \
+            submodule.submodules/zfsonlinux.url \
+            https://git.proxmox.com/git/zfsonlinux.git
+
+          #
+          # Build in Debian Trixie.
+          # The Docker image is pinned to the exact digest already
+          # observed and validated by our CI.
+          #
+
+          DOCKER_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
+
+          docker run \
+            --rm \
+            -v "${PWD}:/workspace" \
+            -w "/workspace/${PVE_DIR}" \
+            "${DOCKER_IMAGE}" \
+            bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+
+              echo "Installing Debian prerequisites..."
+
+              apt-get update -qq
+
+              apt-get install -y -qq \
+                --no-install-recommends \
+                ca-certificates \
+                curl \
+                >/dev/null
+
+              curl \
+                --fail \
+                --location \
+                --silent \
+                --show-error \
+                https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg \
+                -o /usr/share/keyrings/proxmox-archive-keyring.gpg
+
+              cat > /etc/apt/sources.list.d/proxmox.sources <<EOF
+          Types: deb
+          URIs: http://download.proxmox.com/debian/pve
+          Suites: trixie
+          Components: pve-no-subscription
+          Signed-By: /usr/share/keyrings/proxmox-archive-keyring.gpg
+          EOF
+
+              apt-get update -qq
+
+              echo "Installing Proxmox kernel build dependencies..."
+
+              apt-get install -y -qq \
+                --no-install-recommends \
+                asciidoc-base \
+                automake \
+                bc \
+                bindgen \
+                bison \
+                build-essential \
+                cpio \
+                debhelper \
+                dh-python \
+                dpkg-dev \
+                dwarves \
+                fakeroot \
+                file \
+                flex \
+                gawk \
+                gcc \
+                git \
+                kmod \
+                libdw-dev \
+                libelf-dev \
+                libiberty-dev \
+                libnuma-dev \
+                libpve-common-perl \
+                libslang2-dev \
+                libssl-dev \
+                libtool \
+                lintian \
+                lz4 \
+                perl-modules \
+                python3-dev \
+                python3-minimal \
+                rsync \
+                rust-clippy \
+                rust-src \
+                rustc \
+                rustfmt \
+                sphinx-common \
+                xmlto \
+                zlib1g-dev \
+                zstd \
+                >/dev/null
+
+              git config \
+                --global \
+                --add safe.directory \
+                /workspace/proxmox-pve-kernel
+
+              KERNEL_MAJ="$(
+                sed -n "s/^KERNEL_MAJ=//p" Makefile |
+                xargs
+              )"
+              
+              KERNEL_MIN="$(
+                sed -n "s/^KERNEL_MIN=//p" Makefile |
+                xargs
+              )"
+              
+              KERNEL_PATCHLEVEL="$(
+                sed -n "s/^KERNEL_PATCHLEVEL=//p" Makefile |
+                xargs
+              )"
+              
+              if [[ ! "${KERNEL_MAJ}" =~ ^[0-9]+$ ]] ||
+                 [[ ! "${KERNEL_MIN}" =~ ^[0-9]+$ ]] ||
+                 [[ ! "${KERNEL_PATCHLEVEL}" =~ ^[0-9]+$ ]]
+              then
+                echo "ERROR: unable to determine Proxmox kernel base version"
+                exit 1
+              fi
+              
+              KERNEL_BASE="${KERNEL_MAJ}.${KERNEL_MIN}.${KERNEL_PATCHLEVEL}"
+              
+              BUILD_KERNEL_DIR="/workspace/proxmox-pve-kernel/proxmox-kernel-${KERNEL_BASE}/ubuntu-kernel"
+              
+              echo "Kernel base: ${KERNEL_BASE}"
+              echo "Allowing Proxmox build kernel directory:"
+              echo "${BUILD_KERNEL_DIR}"
+              
+              git config \
+                --global \
+                --add safe.directory \
+                "${BUILD_KERNEL_DIR}"
+              
+              echo "Initializing exact Proxmox submodules..."
+
+              git submodule update \
+                --init \
+                --depth 1 \
+                submodules/ubuntu-kernel
+
+              git submodule update \
+                --init \
+                --recursive \
+                submodules/zfsonlinux
+
+              echo
+              echo "Building kernel..."
+              echo
+
+              make deb
+            '
+
+          #
+          # Validate generated packages.
+          #
+
+          echo
+          echo "Build completed. Validating packages..."
+
+          KERNEL_DEB="$(
+            find "${PVE_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "proxmox-kernel-*-pve-t2_*.deb" \
+              -print |
+            sed -n "1p"
+          )"
+
+          HEADER_DEB="$(
+            find "${PVE_DIR}" \
+              -maxdepth 1 \
+              -type f \
+              -name "proxmox-headers-*-pve-t2_*.deb" \
+              -print |
+            sed -n "1p"
+          )"
+
+          if [[ -z "${KERNEL_DEB}" ]]; then
+            echo "ERROR: T2 kernel package was not generated"
+            exit 1
+          fi
+
+          if [[ -z "${HEADER_DEB}" ]]; then
+            echo "ERROR: T2 headers package was not generated"
+            exit 1
+          fi
+
+          echo
+          echo "Kernel package:"
+          dpkg-deb \
+            --show \
+            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
+            "${KERNEL_DEB}"
+
+          echo
+          echo "Headers package:"
+          dpkg-deb \
+            --show \
+            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
+            "${HEADER_DEB}"
+
+          #
+          # Verify that the generated package really contains
+          # our pve-t2 kernel image.
+          #
+
+          KERNEL_CONTENTS="${RUNNER_TEMP}/kernel-package.list"
+          EXPECTED_VMLINUZ="/boot/vmlinuz-${KERNEL_VERSION}-pve-t2"
+          
+          if ! dpkg-deb -c "${KERNEL_DEB}" > "${KERNEL_CONTENTS}"; then
+            echo "ERROR: unable to inspect generated kernel package"
+            exit 1
+          fi
+          
+          if ! grep -Fq "${EXPECTED_VMLINUZ}" "${KERNEL_CONTENTS}"; then
+            echo "ERROR: expected T2 vmlinuz was not found in the package"
+            echo "Expected: ${EXPECTED_VMLINUZ}"
+            echo
+            echo "Files found under /boot:"
+            grep -F "/boot/" "${KERNEL_CONTENTS}" || true
+            exit 1
+          fi
+          
+          echo "Validated T2 kernel image:"
+          grep -F "${EXPECTED_VMLINUZ}" "${KERNEL_CONTENTS}"
+
+          echo
+          echo "Generating SHA256 checksums..."
+
+          sha256sum \
+            "${KERNEL_DEB}" \
+            "${HEADER_DEB}" \
+            | tee "${PVE_DIR}/SHA256SUMS"
+
+          echo
+          echo "FIRST T2 KERNEL BUILD SUCCESSFUL"
+          echo "Kernel: ${KERNEL_VERSION}-pve-t2"
+
+          echo "kernel_deb=${KERNEL_DEB}" >> "$GITHUB_OUTPUT"
+          echo "header_deb=${HEADER_DEB}" >> "$GITHUB_OUTPUT"
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+
+          ## First T2 kernel build
+          - Target: \`Macmini8,1\`
+          - Kernel: \`${KERNEL_VERSION}-pve-t2\`
+          - Build result: **SUCCESS**
+          - Kernel package: \`$(basename "${KERNEL_DEB}")\`
+          - Headers package: \`$(basename "${HEADER_DEB}")\`
+          EOF
+
+      - name: Upload first T2 kernel artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pve-t2-${{ steps.pve_repo.outputs.kernel }}-macmini8-1
+          path: |
+            proxmox-pve-kernel/proxmox-kernel-*-pve-t2_*.deb
+            proxmox-pve-kernel/proxmox-headers-*-pve-t2_*.deb
+            proxmox-pve-kernel/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Write discovery summary
+        if: always()
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          # Upstream discovery
+
+          ## Published Proxmox kernel
+          - Repository: `pve-no-subscription`
+          - Package: `${{ steps.pve_repo.outputs.package }}`
+          - Kernel: `${{ steps.pve_repo.outputs.kernel }}`
+          - Package version: `${{ steps.pve_repo.outputs.version }}`
+
+          ## Proxmox source
+          - SHA: `${{ steps.pve.outputs.sha }}`
+          - Commit: `${{ steps.pve.outputs.subject }}`
+          - Debian changelog: `${{ steps.pve.outputs.changelog }}`
+
+          ## T2 candidate
+          - SHA: `${{ steps.t2.outputs.sha }}`
+          - Kernel target: `${{ steps.t2.outputs.kver }}`
+          - Commit: `${{ steps.t2.outputs.subject }}`
+
+          ## Compatibility
+          - Baseline compatible: `${{ steps.compat.outputs.compatible }}`
+          - T2 patches applied: `${{ steps.compat.outputs.patch_count }}`
+          - T2 patches skipped: `${{ steps.compat.outputs.skipped_count }}`
+          - Skipped patch: `${{ steps.compat.outputs.skipped_patch }}`
+          - Failed patch: `${{ steps.compat.outputs.failed_patch }}`
+
+          No kernel is compiled or published yet.
+          EOF
