@@ -1,4 +1,4 @@
-name: Bootstrap upstream discovery
+name: Build T2 kernel
 
 on:
   workflow_dispatch:
