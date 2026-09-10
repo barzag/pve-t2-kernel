@@ -17,6 +17,7 @@ MACMINI_T2_PATCHES=(
   "3004-applesmc-key-interface-wrappers.patch"
   "3005-applesmc-basic-mmio-interface-implementation.patch"
   "3006-applesmc-fan-support-on-T2-Macs.patch"
+  "3008-applesmc-make-applesmc_remove-void.patch"
 )
 
 if [[ -z "${PVE_SHA:-}" ]]; then
