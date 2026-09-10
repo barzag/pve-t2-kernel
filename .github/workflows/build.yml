@@ -13,7 +13,8 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4    
+        uses: actions/checkout@v4
+
       - name: Discover latest published Proxmox kernel
         id: pve_repo
         shell: bash
@@ -45,7 +46,7 @@ jobs:
           T2_SHA: ${{ steps.t2.outputs.sha }}
         run: |
           bash scripts/validate-patches.sh
-          
+
       - name: Prepare T2 build tree for Macmini8,1
         id: integrate
         shell: bash
@@ -65,7 +66,7 @@ jobs:
           PVE_DIR="proxmox-pve-kernel"
           KERNEL_VERSION="${{ steps.pve_repo.outputs.kernel }}"
 
-          echo "Starting first real T2 kernel build"
+          echo "Starting T2 kernel build"
           echo "Target:  Macmini8,1"
           echo "Kernel:  ${KERNEL_VERSION}-pve-t2"
 
@@ -102,8 +103,6 @@ jobs:
 
           #
           # Build in Debian Trixie.
-          # The Docker image is pinned to the exact digest already
-          # observed and validated by our CI.
           #
 
           DOCKER_IMAGE="debian:trixie@sha256:f324c7ff54321e8d9c588493a20244965938ce0aa50bbd1022d38010e9ffc4b1"
@@ -200,17 +199,17 @@ jobs:
                 sed -n "s/^KERNEL_MAJ=//p" Makefile |
                 xargs
               )"
-              
+
               KERNEL_MIN="$(
                 sed -n "s/^KERNEL_MIN=//p" Makefile |
                 xargs
               )"
-              
+
               KERNEL_PATCHLEVEL="$(
                 sed -n "s/^KERNEL_PATCHLEVEL=//p" Makefile |
                 xargs
               )"
-              
+
               if [[ ! "${KERNEL_MAJ}" =~ ^[0-9]+$ ]] ||
                  [[ ! "${KERNEL_MIN}" =~ ^[0-9]+$ ]] ||
                  [[ ! "${KERNEL_PATCHLEVEL}" =~ ^[0-9]+$ ]]
@@ -218,20 +217,20 @@ jobs:
                 echo "ERROR: unable to determine Proxmox kernel base version"
                 exit 1
               fi
-              
+
               KERNEL_BASE="${KERNEL_MAJ}.${KERNEL_MIN}.${KERNEL_PATCHLEVEL}"
-              
+
               BUILD_KERNEL_DIR="/workspace/proxmox-pve-kernel/proxmox-kernel-${KERNEL_BASE}/ubuntu-kernel"
-              
+
               echo "Kernel base: ${KERNEL_BASE}"
               echo "Allowing Proxmox build kernel directory:"
               echo "${BUILD_KERNEL_DIR}"
-              
+
               git config \
                 --global \
                 --add safe.directory \
                 "${BUILD_KERNEL_DIR}"
-              
+
               echo "Initializing exact Proxmox submodules..."
 
               git submodule update \
@@ -251,106 +250,17 @@ jobs:
               make deb
             '
 
-          #
-          # Validate generated packages.
-          #
+      - name: Validate generated T2 packages
+        id: packages
+        shell: bash
+        env:
+          PVE_DIR: proxmox-pve-kernel
+          KERNEL_VERSION: ${{ steps.pve_repo.outputs.kernel }}
+        run: |
+          bash scripts/validate-packages.sh
 
-          echo
-          echo "Build completed. Validating packages..."
-
-          KERNEL_DEB="$(
-            find "${PVE_DIR}" \
-              -maxdepth 1 \
-              -type f \
-              -name "proxmox-kernel-*-pve-t2_*.deb" \
-              -print |
-            sed -n "1p"
-          )"
-
-          HEADER_DEB="$(
-            find "${PVE_DIR}" \
-              -maxdepth 1 \
-              -type f \
-              -name "proxmox-headers-*-pve-t2_*.deb" \
-              -print |
-            sed -n "1p"
-          )"
-
-          if [[ -z "${KERNEL_DEB}" ]]; then
-            echo "ERROR: T2 kernel package was not generated"
-            exit 1
-          fi
-
-          if [[ -z "${HEADER_DEB}" ]]; then
-            echo "ERROR: T2 headers package was not generated"
-            exit 1
-          fi
-
-          echo
-          echo "Kernel package:"
-          dpkg-deb \
-            --show \
-            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
-            "${KERNEL_DEB}"
-
-          echo
-          echo "Headers package:"
-          dpkg-deb \
-            --show \
-            --showformat='Package: ${Package}\nVersion: ${Version}\nArchitecture: ${Architecture}\n' \
-            "${HEADER_DEB}"
-
-          #
-          # Verify that the generated package really contains
-          # our pve-t2 kernel image.
-          #
-
-          KERNEL_CONTENTS="${RUNNER_TEMP}/kernel-package.list"
-          EXPECTED_VMLINUZ="/boot/vmlinuz-${KERNEL_VERSION}-pve-t2"
-          
-          if ! dpkg-deb -c "${KERNEL_DEB}" > "${KERNEL_CONTENTS}"; then
-            echo "ERROR: unable to inspect generated kernel package"
-            exit 1
-          fi
-          
-          if ! grep -Fq "${EXPECTED_VMLINUZ}" "${KERNEL_CONTENTS}"; then
-            echo "ERROR: expected T2 vmlinuz was not found in the package"
-            echo "Expected: ${EXPECTED_VMLINUZ}"
-            echo
-            echo "Files found under /boot:"
-            grep -F "/boot/" "${KERNEL_CONTENTS}" || true
-            exit 1
-          fi
-          
-          echo "Validated T2 kernel image:"
-          grep -F "${EXPECTED_VMLINUZ}" "${KERNEL_CONTENTS}"
-
-          echo
-          echo "Generating SHA256 checksums..."
-
-          sha256sum \
-            "${KERNEL_DEB}" \
-            "${HEADER_DEB}" \
-            | tee "${PVE_DIR}/SHA256SUMS"
-
-          echo
-          echo "FIRST T2 KERNEL BUILD SUCCESSFUL"
-          echo "Kernel: ${KERNEL_VERSION}-pve-t2"
-
-          echo "kernel_deb=${KERNEL_DEB}" >> "$GITHUB_OUTPUT"
-          echo "header_deb=${HEADER_DEB}" >> "$GITHUB_OUTPUT"
-
-          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-
-          ## First T2 kernel build
-          - Target: \`Macmini8,1\`
-          - Kernel: \`${KERNEL_VERSION}-pve-t2\`
-          - Build result: **SUCCESS**
-          - Kernel package: \`$(basename "${KERNEL_DEB}")\`
-          - Headers package: \`$(basename "${HEADER_DEB}")\`
-          EOF
-
-      - name: Upload first T2 kernel artifacts
+      - name: Upload T2 kernel artifacts
+        id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: pve-t2-${{ steps.pve_repo.outputs.kernel }}-macmini8-1
@@ -361,12 +271,16 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
-      - name: Write discovery summary
+
+      - name: Write build summary
         if: always()
         shell: bash
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
-          # Upstream discovery
+          # T2 kernel workflow
+
+          ## Target
+          - Hardware: `Macmini8,1`
 
           ## Published Proxmox kernel
           - Repository: `pve-no-subscription`
@@ -379,7 +293,7 @@ jobs:
           - Commit: `${{ steps.pve.outputs.subject }}`
           - Debian changelog: `${{ steps.pve.outputs.changelog }}`
 
-          ## T2 candidate
+          ## T2 source
           - SHA: `${{ steps.t2.outputs.sha }}`
           - Kernel target: `${{ steps.t2.outputs.kver }}`
           - Commit: `${{ steps.t2.outputs.subject }}`
@@ -391,5 +305,14 @@ jobs:
           - Skipped patch: `${{ steps.compat.outputs.skipped_patch }}`
           - Failed patch: `${{ steps.compat.outputs.failed_patch }}`
 
-          No kernel is compiled or published yet.
+          ## Integration
+          - Target: `${{ steps.integrate.outputs.target }}`
+          - T2 patches staged: `${{ steps.integrate.outputs.patch_count }}`
+          - T2 config options: `${{ steps.integrate.outputs.config_count }}`
+          - Kernel suffix: `${{ steps.integrate.outputs.suffix }}`
+
+          ## Result
+          - Kernel build: `${{ steps.build.outcome }}`
+          - Package validation: `${{ steps.packages.outcome }}`
+          - Artifact upload: `${{ steps.upload.outcome }}`
           EOF
